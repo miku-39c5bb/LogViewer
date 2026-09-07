@@ -1,4 +1,4 @@
 /target
-hello.exe
-hello.rs
-sample.log
+*.log
+build.bat
+build.ps1

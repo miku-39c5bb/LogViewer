@@ -419,6 +419,46 @@ mod tests {
     }
 
     #[test]
+    fn end_to_end_utf16le_search() {
+        // UTF-16LE（带 BOM）：转码 Reader + 引擎路径
+        let text = "甲行\n第二行 hello\n丙\n";
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in text.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        let p = tmpfile2(&bytes);
+        let s = RgSearch::start(
+            p.to_str().unwrap(),
+            "行",
+            "utf-16le",
+            Case::Sensitive,
+            false,
+        )
+        .unwrap();
+        let (hits, done, _) = collect(&s);
+        assert!(done);
+        assert_eq!(
+            hits.iter().map(|x| x.0).collect::<Vec<_>>(),
+            vec![1, 2],
+            "hits={hits:?}"
+        );
+        let s = RgSearch::start(
+            p.to_str().unwrap(),
+            "hello",
+            "utf-16le",
+            Case::Sensitive,
+            false,
+        )
+        .unwrap();
+        let (hits, done, _) = collect(&s);
+        assert!(done);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 2);
+        assert_eq!(hits[0].1, "第二行 hello", "hits={hits:?}");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
     fn end_to_end_inline_search() {
         let p = tmpfile("first line\nhello world\nanother hello here\nLOG it\n");
         // 大小写敏感 / hello

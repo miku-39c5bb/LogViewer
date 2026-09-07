@@ -17,7 +17,9 @@ struct Slot {
 }
 
 pub struct FileSource {
-    file: File,
+    file: Option<File>,
+    /// 内存字节源（如 UTF-16 转码后）；None 时用 file 磁盘读取
+    bytes: Option<Vec<u8>>,
     len: u64,
     chunk_size: usize,
     cache: Vec<Slot>,
@@ -45,13 +47,28 @@ impl FileSource {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
         Ok(Self {
-            file,
+            file: Some(file),
+            bytes: None,
             len,
             chunk_size: DEFAULT_CHUNK_SIZE,
             cache: Vec::with_capacity(CACHE_SLOTS),
             seq: 0,
             io_err: None,
         })
+    }
+
+    /// 从内存字节构造（如 UTF-16 全量转码后的 UTF-8）。无磁盘 IO，长度恒定。
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        let len = bytes.len() as u64;
+        Self {
+            file: None,
+            bytes: Some(bytes),
+            len,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            cache: Vec::with_capacity(CACHE_SLOTS),
+            seq: 0,
+            io_err: None,
+        }
     }
 
     /// 测试专用：自定义块大小，用于构造跨块行。
@@ -78,11 +95,13 @@ impl FileSource {
         self.cache.clear();
     }
 
-    /// 刷新文件长度（日志追加检测），返回最新长度。
+    /// 刷新文件长度（日志追加检测），返回最新长度。内存源恒定。
     pub fn refresh_len(&mut self) -> u64 {
-        match self.file.metadata() {
-            Ok(md) => self.len = md.len(),
-            Err(e) => self.io_err = Some(e),
+        if let Some(f) = &self.file {
+            match f.metadata() {
+                Ok(md) => self.len = md.len(),
+                Err(e) => self.io_err = Some(e),
+            }
         }
         self.len
     }
@@ -95,6 +114,15 @@ impl FileSource {
     pub fn chunk(&mut self, idx: u64) -> Vec<u8> {
         let cs = self.chunk_size as u64;
         let start = idx.saturating_mul(cs);
+        // 内存字节源：直接切片复制（无需 IO/缓存）
+        if let Some(b) = &self.bytes {
+            if start >= self.len {
+                return Vec::new();
+            }
+            let s = start as usize;
+            let e = (s + self.chunk_size).min(b.len());
+            return b[s..e].to_vec();
+        }
         if start >= self.len {
             // 起始越界：刷新一次长度再判定，避免漏掉刚追加的数据
             self.refresh_len();
@@ -107,14 +135,16 @@ impl FileSource {
             self.seq = self.seq.wrapping_add(1);
             return slot.data.clone();
         }
-        if let Err(e) = self.file.seek(SeekFrom::Start(start)) {
+        let file = self.file.as_mut().expect("file source");
+        let mut f = file;
+        if let Err(e) = f.seek(SeekFrom::Start(start)) {
             self.io_err = Some(e);
             return Vec::new();
         }
         let mut buf = vec![0u8; self.chunk_size];
         let mut got = 0usize;
         loop {
-            match self.file.read(&mut buf[got..]) {
+            match f.read(&mut buf[got..]) {
                 Ok(0) => break,
                 Ok(n) => {
                     got += n;

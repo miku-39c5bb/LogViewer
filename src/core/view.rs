@@ -10,7 +10,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use encoding_rs::{Encoding, GB18030, UTF_8};
+use encoding_rs::{Encoding, GB18030, UTF_16BE, UTF_16LE, UTF_8};
 
 use crate::core::file::FileSource;
 use crate::core::index::LineIndex;
@@ -32,8 +32,10 @@ pub struct FileView {
     src: FileSource,
     path: PathBuf,
     index: LineIndex,
-    /// 内容编码（探测：UTF-8 优先；无 BOM 中文回退 GB18030，兼容 GBK/GB2312）
+    /// 内容解码编码（UTF-16 已全量转码为 UTF-8 内存流，故为 UTF_8）
     encoding: &'static Encoding,
+    /// 供搜索层使用的原始编码标签（小写 canonical 名）
+    search_label: String,
     /// 视口首行行号（0-based）
     top_row0: u64,
     /// 光标行（0-based，须位于视口内；less 风格）
@@ -61,6 +63,12 @@ fn detect_encoding(path: &Path) -> &'static Encoding {
     if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return UTF_8; // UTF-8 BOM
     }
+    if head.starts_with(&[0xFF, 0xFE]) {
+        return UTF_16LE; // UTF-16 LE BOM
+    }
+    if head.starts_with(&[0xFE, 0xFF]) {
+        return UTF_16BE; // UTF-16 BE BOM
+    }
     match std::str::from_utf8(head) {
         Ok(_) => UTF_8,
         // 仅"末尾不完整序列"（error_len == None，4096 字节截断在字符中间）仍视为 UTF-8；
@@ -86,14 +94,23 @@ impl FileView {
     }
 
     pub fn open_with<P: AsRef<Path>>(path: P, max_row_bytes: usize) -> io::Result<Self> {
-        let src = FileSource::open(path.as_ref())?;
+        let detected = detect_encoding(path.as_ref());
+        let label = detected.name().to_ascii_lowercase();
+        // UTF-16：全量流式转码为 UTF-8 内存流（行结构 1:1 保持），再交给字节行引擎。
+        let (src, encoding) = if detected == UTF_16LE || detected == UTF_16BE {
+            let raw = std::fs::read(path.as_ref())?;
+            let (cow, _, _) = detected.decode(&raw); // 自动剥离 BOM
+            (FileSource::from_bytes(cow.into_owned().into_bytes()), UTF_8)
+        } else {
+            (FileSource::open(path.as_ref())?, detected)
+        };
         let last_len = src.len();
-        let encoding = detect_encoding(path.as_ref());
         Ok(Self {
             src,
             path: path.as_ref().to_path_buf(),
             index: LineIndex::new(),
             encoding,
+            search_label: label,
             top_row0: 0,
             cursor_row0: 0,
             vh: 24,
@@ -113,9 +130,9 @@ impl FileView {
         decode_text(self.encoding, bytes)
     }
 
-    /// 给搜索层用的编码标签（小写 canonical 名）。
+    /// 给搜索层用的编码标签（小写 canonical 名；UTF-16 转码后仍报原始编码以便搜索走转码路径）。
     pub fn encoding_label(&self) -> String {
-        self.encoding.name().to_ascii_lowercase()
+        self.search_label.clone()
     }
 
     pub fn file_len(&self) -> u64 {
@@ -543,6 +560,31 @@ mod tests {
         assert_eq!(v.cursor_line1(), 3);
         assert_eq!(v.rows().last().unwrap().text, "three");
         assert_eq!(v.total_rows(), Some(3));
+        std::fs::remove_file(&p).ok();
+    }
+
+    fn utf16_bytes_le(s: &str) -> Vec<u8> {
+        let mut v = Vec::new();
+        for u in s.encode_utf16() {
+            v.extend_from_slice(&u.to_le_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn utf16le_view() {
+        // UTF-16 LE + BOM 文件：打开即全量转码，行文本正确
+        let p = tmp_path("viewutf16");
+        let text = "甲行\n第二行 hello\n丙\n";
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend_from_slice(&utf16_bytes_le(text));
+        std::fs::write(&p, &bytes).unwrap();
+        let mut v = FileView::open(&p).unwrap();
+        v.fill_to(10);
+        assert_eq!(v.row_count(), 3, "rows={:?}", v.rows());
+        assert_eq!(v.rows()[0].text, "甲行");
+        assert_eq!(v.rows()[1].text, "第二行 hello");
+        assert_eq!(v.rows()[2].text, "丙");
         std::fs::remove_file(&p).ok();
     }
 
