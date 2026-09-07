@@ -262,6 +262,19 @@ pub struct SearchPrefs {
     pub word: bool,
 }
 
+/// 耗时跳转目标（分片执行，可 Ctrl+C / Esc 取消）
+#[derive(Clone, Copy)]
+enum JumpKind {
+    Goto(u64), // 1-based 行号
+    Bottom,
+}
+
+struct Jump {
+    kind: JumpKind,
+    back: (u64, u64),
+    start: std::time::Instant,
+}
+
 pub struct App {
     panes: Vec<Pane>,
     /// 布局树（叶子 id 顺序与 panes 顺序一致 = 几何顺序）
@@ -277,6 +290,12 @@ pub struct App {
     keys: crate::keymap::Keymap,
     /// 搜索选项
     opts: SearchPrefs,
+    /// 耗时跳转任务（分片）
+    pending_jump: Option<Jump>,
+    /// 一次性英文提示（按键即消失），如耗时/取消信息
+    trans: Option<String>,
+    /// 最近一次 rg 搜索的启动时刻
+    search_start: Option<std::time::Instant>,
     /// 焦点窗最近可视列数（$ 行尾用）
     last_cols: usize,
     history: History,
@@ -326,6 +345,9 @@ impl App {
                 case: crate::search::Case::Smart,
                 word: false,
             },
+            pending_jump: None,
+            trans: None,
+            search_start: None,
             last_cols: 100,
             history,
             mode: Mode::Normal,
@@ -366,6 +388,7 @@ impl App {
 
     fn on_tick(&mut self) {
         self.harvest_file_search();
+        self.process_jump();
         self.follow_poll();
     }
 
@@ -393,12 +416,14 @@ impl App {
                     Ok(RgMsg::Error(e)) => note = Some(format!("rg: {e}")),
                     Ok(RgMsg::Done { count, cancelled }) => {
                         a.done = true;
+                        let dur = self.search_start.take().map(|s| s.elapsed());
+                        let dur_txt = dur.map(|d| format!(" ({})", ms_text(d))).unwrap_or_default();
                         note = if cancelled {
-                            Some("搜索已取消".to_string())
+                            Some(format!("search cancelled{dur_txt}"))
                         } else if count == 0 {
-                            Some("无匹配".to_string())
+                            Some(format!("search done: no matches{dur_txt}"))
                         } else {
-                            None
+                            Some(format!("search done{dur_txt}"))
                         };
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -415,7 +440,7 @@ impl App {
             (note, fj)
         };
         if let Some(n) = note {
-            self.set_msg(n);
+            self.set_trans(n);
         }
         if first_jump {
             self.init_first_jump();
@@ -678,10 +703,139 @@ impl App {
     }
 }
 
+// ---------- 耗时操作（分片跳转 / processing / 取消）----------
+
+/// 人类可读毫秒格式（保留 ms 精度）。
+fn ms_text(d: std::time::Duration) -> String {
+    let ms = d.as_secs_f64() * 1000.0;
+    if ms >= 1000.0 {
+        format!("{:.2} s", ms / 1000.0)
+    } else {
+        format!("{:.0} ms", ms)
+    }
+}
+
+impl App {
+    /// 发起分片耗时跳转（G / :行号）。
+    fn start_jump(&mut self, kind: JumpKind) {
+        let Content::File(fc) = &mut self.panes[0].content else {
+            return;
+        };
+        if self.pending_jump.is_some() {
+            return;
+        }
+        let back = fc.view.snapshot_pos();
+        self.pending_jump = Some(Jump {
+            kind,
+            back,
+            start: std::time::Instant::now(),
+        });
+    }
+
+    /// 每帧推进跳转分片；完成时执行定位并显示耗时。
+    fn process_jump(&mut self) {
+        let target1 = match self.pending_jump.as_ref() {
+            Some(j) => match j.kind {
+                JumpKind::Goto(l) => Some(l),
+                JumpKind::Bottom => None,
+            },
+            None => return,
+        };
+        // 每帧最多推进 4000 个 checkpoint 块（约 4M 行），期间事件循环可响应取消键
+        let done = {
+            let Content::File(fc) = &mut self.panes[0].content else {
+                return;
+            };
+            fc.view.extend_toward(target1, 4000)
+        };
+        if !done {
+            return;
+        }
+        let (kind, start) = {
+            let j = self.pending_jump.as_ref().unwrap();
+            (j.kind, j.start)
+        };
+        self.pending_jump = None;
+        let dur = start.elapsed();
+        let ok = {
+            let Content::File(fc) = &mut self.panes[0].content else {
+                return;
+            };
+            match kind {
+                JumpKind::Bottom => {
+                    fc.view.scroll_to_bottom();
+                    fc.view.fill_to(fc.inner_h);
+                    true
+                }
+                JumpKind::Goto(line1) => {
+                    let ok = fc.view.goto_line1(line1);
+                    if ok {
+                        fc.view.fill_to(fc.inner_h);
+                    }
+                    ok
+                }
+            }
+        };
+        let label = match kind {
+            JumpKind::Goto(l) => format!("goto line {l}"),
+            JumpKind::Bottom => "goto end of file".to_string(),
+        };
+        if ok {
+            self.set_trans(format!("{label} done ({})", ms_text(dur)));
+        } else {
+            self.set_trans(format!("{label} failed: line out of range"));
+        }
+    }
+
+    /// 取消当前耗时跳转并恢复原位。
+    fn cancel_jump(&mut self, why: &str) {
+        if let Some(j) = self.pending_jump.take() {
+            let Content::File(fc) = &mut self.panes[0].content else {
+                return;
+            };
+            fc.view.restore_pos(j.back.0, j.back.1);
+            fc.view.fill_to(fc.inner_h);
+            self.set_trans(why.to_string());
+        }
+    }
+
+    /// 设置一次性英文提示（任意按键后消失）。
+    fn set_trans(&mut self, s: String) {
+        self.trans = Some(s);
+    }
+
+    /// 退出或取消：有耗时跳转 → 取消它；有进行中的搜索 → 取消搜索；否则退出。
+    fn try_quit(&mut self) {
+        if self.pending_jump.is_some() {
+            self.cancel_jump("cancelled: jump");
+            return;
+        }
+        let searching = {
+            let Content::File(fc) = &self.panes[0].content else {
+                return;
+            };
+            fc.search.as_ref().map(|a| !a.done).unwrap_or(false)
+        };
+        if searching {
+            if let Content::File(fc) = &mut self.panes[0].content {
+                if let Some(a) = fc.search.take() {
+                    a.runner.cancel();
+                }
+                fc.hl = None;
+            }
+            self.set_trans("cancelled: search".to_string());
+            return;
+        }
+        self.quit = true;
+    }
+}
+
 // ---------- 按键分发 ----------
 
 impl App {
     fn on_key(&mut self, key: KeyEvent) {
+        // 任意按键清除一次性英文提示（耗时/取消消息）
+        self.trans = None;
         if self.mode.is_cmd() {
             self.on_cmd_key(key);
         } else if self.mode.is_pick() {
@@ -738,6 +892,11 @@ impl App {
     }
 
     fn on_normal_key(&mut self, key: KeyEvent) {
+        // Esc：取消耗时跳转（无则忽略）
+        if key.code == KeyCode::Esc {
+            self.cancel_jump("cancelled: jump");
+            return;
+        }
         // 数字键 1-9：直接把焦点切到对应编号窗格（编号 = 几何顺序，动态不进入配置表）
         if let KeyCode::Char(d) = key.code {
             if d.is_ascii_digit() && d != '0' {
@@ -760,7 +919,7 @@ impl App {
     fn dispatch_normal(&mut self, act: crate::keymap::Action) {
         use crate::keymap::Action as A;
         match act {
-            A::Quit => self.quit = true,
+            A::Quit => self.try_quit(),
             A::FocusNext => {
                 if self.panes.len() > 1 {
                     self.focus = (self.focus + 1) % self.panes.len();
@@ -780,7 +939,13 @@ impl App {
             A::PageDown => self.pane_page(1, false),
             A::PageUp => self.pane_page(-1, false),
             A::ToTop => self.pane_home(),
-            A::ToBottom => self.pane_end(),
+            A::ToBottom => {
+                if self.focus == 0 {
+                    self.start_jump(JumpKind::Bottom);
+                } else {
+                    self.pane_end();
+                }
+            }
             A::SearchFwd => self.start_cmd(true),
             A::SearchBack => self.start_cmd(false),
             A::MatchNext => {
@@ -1500,15 +1665,8 @@ impl App {
             }
         };
         if self.focus == 0 {
-            let Content::File(fc) = &mut self.panes[0].content else {
-                return;
-            };
-            if fc.view.goto_line1(line1) {
-                fc.view.fill_to(fc.inner_h);
-                self.set_msg(format!("跳到 {} 行", line1));
-            } else {
-                self.set_msg(format!("行号 {line1} 超出文件范围"));
-            }
+            // 大文件行号跳转耗时，走分片 job（可 Ctrl+C / Esc 取消，状态栏显示 processing）
+            self.start_jump(JumpKind::Goto(line1));
         } else {
             // 子窗：在列表中定位 line_no == line1 的行
             let target = {
@@ -1560,6 +1718,7 @@ impl App {
         }
         let path2 = path.clone();
         let pat2 = pattern.to_string();
+        self.search_start = Some(std::time::Instant::now());
         match RgSearch::start(&path2, &pat2, &enc, case, word) {
             Ok(runner) => {
                 if let Content::File(fc) = &mut self.panes[0].content {
@@ -1720,6 +1879,121 @@ impl App {
 // ---------- 渲染 ----------
 
 impl App {
+    /// 子窗（匹配列表）wrap 模式：选中行位于列表末尾时，把 top 调整到视觉行贴住列表尾部。
+    fn wrap_list_bottom_fit(mc: &mut MatchesContent, cols: usize) {
+        if !mc.wrap || mc.rows.is_empty() {
+            return;
+        }
+        let last = mc.rows.len() - 1;
+        if mc.sel != last {
+            return; // 不在列表末尾
+        }
+        let ln_w = mc
+            .rows
+            .iter()
+            .map(|m| m.line_no.to_string().len())
+            .max()
+            .unwrap_or(6)
+            .max(4);
+        let budget = cols.saturating_sub(1 + ln_w + 1).max(4);
+        let need = mc.inner_h.max(4);
+        // 每行 wrap 段数（一次性统计，供快速调整 top）
+        let segs: Vec<usize> = mc
+            .rows
+            .iter()
+            .map(|m| {
+                let t = m.text.as_str();
+                if UnicodeWidthStr::width(t) <= budget {
+                    1
+                } else {
+                    wrap_cols(t, budget).len()
+                }
+            })
+            .collect();
+        let mut top = mc.top.min(last);
+        for _ in 0..12 {
+            let vs: usize = segs[top..].iter().sum();
+            if (vs as i64 - need as i64).abs() <= 1 {
+                break;
+            }
+            let n = last - top + 1; // 剩余逻辑行数（至少 1）
+            let avg = (vs as f64 / n.max(1) as f64).max(1.0);
+            if vs > need {
+                let drop = ((vs - need) as f64 / avg).ceil() as usize;
+                let nt = top + drop;
+                if nt >= last {
+                    top = last;
+                    break;
+                }
+                top = nt;
+            } else if top > 0 {
+                let add = ((need - vs) as f64 / avg).ceil() as usize;
+                top = top.saturating_sub(add);
+            } else {
+                break;
+            }
+        }
+        mc.top = top;
+    }
+
+    /// wrap 模式下，光标位于文件尾部时把视口顶行调整到「视觉行恰好贴住文件尾」。
+    fn wrap_tail_fit(fc: &mut FileContent, cols: usize) {
+        if !fc.wrap {
+            return;
+        }
+        let Some(total) = fc.view.known_total() else {
+            return;
+        };
+        if fc.view.cursor_line1() < total {
+            return; // 不在文件尾
+        }
+        let need = fc.inner_h.max(4);
+        for _ in 0..12 {
+            fc.view.fill_to(fc.inner_h);
+            let (vs, n) = {
+                let rows = fc.view.rows();
+                if rows.is_empty() {
+                    return;
+                }
+                let top = fc.view.top_line1();
+                let last = top + rows.len() as u64 - 1;
+                let ln_w = last.to_string().len().max(4);
+                let budget = cols.saturating_sub(1 + ln_w + 1).max(4);
+                let mut vs = 0usize;
+                for r in rows.iter() {
+                    let t = r.text.as_str();
+                    vs += if UnicodeWidthStr::width(t) <= budget {
+                        1
+                    } else {
+                        wrap_cols(t, budget).len()
+                    };
+                }
+                (vs, rows.len())
+            };
+            if n == 0 {
+                return;
+            }
+            if (vs as i64 - need as i64).abs() <= 1 {
+                return;
+            }
+            let avg = (vs as f64 / n as f64).max(1.0);
+            let cur_row = (fc.view.cursor_line1() - 1) as i64;
+            let cur_top = fc.view.top_line1() as i64 - 1;
+            if vs > need {
+                let drop = ((vs - need) as f64 / avg).ceil() as i64;
+                let t = (cur_top + drop).min(cur_row).max(0) as u64;
+                fc.view.set_top(t);
+            } else if cur_top > 0 {
+                let add = ((need - vs) as f64 / avg).ceil() as i64;
+                let t = (cur_top - add).max(0) as u64;
+                fc.view.set_top(t);
+            } else {
+                return;
+            }
+        }
+        fc.view.fill_to(fc.inner_h);
+    }
+
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         if area.height < 3 {
@@ -1754,10 +2028,18 @@ impl App {
             if let Content::File(fc) = &mut self.panes[*idx].content {
                 fc.inner_h = inner_h;
                 fc.view.fill_to(inner_h);
+                // wrap 且光标在文件尾部时：把视口贴住文件尾（视觉行对齐）
+                if fc.wrap {
+                    Self::wrap_tail_fit(fc, rect.width.saturating_sub(2).max(1) as usize);
+                }
             }
             if let Content::Matches(mc) = &mut self.panes[*idx].content {
                 mc.inner_h = inner_h;
                 mc.keep_visible();
+                // wrap 且选中行在列表末尾：视口视觉行贴底
+                if mc.wrap {
+                    Self::wrap_list_bottom_fit(mc, rect.width.saturating_sub(2).max(1) as usize);
+                }
             }
         }
         // 2) 收割（可能触发跳转重建视口，再次填充）
@@ -1949,6 +2231,9 @@ impl App {
 
     fn render_status(&mut self, frame: &mut Frame, area: Rect) {
         let mut text = String::new();
+        if self.pending_jump.is_some() {
+            text.push_str("[processing...]  ");
+        }
         match &self.panes[self.focus].content {
             Content::File(fc) => {
                 let rows_n = fc.view.row_count();
@@ -2006,7 +2291,9 @@ impl App {
             self.opts.case.label(),
             if self.opts.word { "开" } else { "关" }
         ));
-        if !self.msg.is_empty() {
+        if let Some(t) = &self.trans {
+            text.push_str(&format!("   [ {t} ]"));
+        } else if !self.msg.is_empty() {
             text.push_str(&format!("   {msg}", msg = self.msg));
         }
         let line = Line::from(Span::styled(

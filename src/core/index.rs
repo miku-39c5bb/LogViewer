@@ -72,16 +72,22 @@ impl LineIndex {
         self.extend(src, None);
     }
 
-    /// 扩展索引，直到覆盖第 `up_to` 行（含）或遇到文件尾。
-    fn extend(&mut self, src: &mut FileSource, up_to: Option<u64>) {
+    /// 渐进扩展（供分片耗时跳转）：本次最多推进 max_blocks 个 checkpoint 块。
+    /// 返回 true 表示目标已达成：已覆盖 up_to 行（或 up_to=None 时已到 EOF）。
+    pub fn extend_progress(
+        &mut self,
+        src: &mut FileSource,
+        up_to: Option<u64>,
+        max_blocks: u64,
+    ) -> bool {
+        let mut blocks = 0u64;
         while !self.at_eof {
             let cur = self.parsed_rows;
             if let Some(u) = up_to {
                 if cur > u {
-                    return;
+                    return true;
                 }
             }
-            // 本次推进到 up_to 与下一个 checkpoint 边界中较近者
             let nxt_ck = ((cur / self.interval) + 1) * self.interval;
             let stop = match up_to {
                 Some(u) => u.min(nxt_ck - 1),
@@ -106,7 +112,17 @@ impl LineIndex {
                     self.at_eof = true;
                 }
             }
+            blocks += 1;
+            if blocks >= max_blocks {
+                return false;
+            }
         }
+        true
+    }
+
+    /// 扩展索引，直到覆盖第 `up_to` 行（含）或遇到文件尾。
+    fn extend(&mut self, src: &mut FileSource, up_to: Option<u64>) {
+        self.extend_progress(src, up_to, u64::MAX);
     }
 }
 

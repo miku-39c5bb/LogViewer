@@ -284,6 +284,35 @@ impl FileView {
         }
     }
 
+    /// 渐进扩展行索引使目标（1-based 行号，None=文件尾）可定位。
+    /// 每帧最多推进 max_blocks 个 checkpoint 块；返回是否已达成目标（含 EOF）。
+    pub fn extend_toward(&mut self, target_line1: Option<u64>, max_blocks: u64) -> bool {
+        self.refresh_tail();
+        let t = target_line1.map(|l| l.saturating_sub(1));
+        self.index.extend_progress(&mut self.src, t, max_blocks)
+    }
+
+    /// 当前视口位置快照（取消耗时跳转时恢复用）。
+    pub fn snapshot_pos(&self) -> (u64, u64) {
+        (self.top_row0, self.cursor_row0)
+    }
+
+    /// 恢复视口位置（top_row0, cursor_row0，均为 0-based）。
+    pub fn restore_pos(&mut self, top_row0: u64, cursor_row0: u64) {
+        self.top_row0 = top_row0;
+        self.cursor_row0 = cursor_row0;
+        self.rows.clear();
+    }
+
+    /// 只调整视口顶行（不影响光标；clamp 不超过光标行）。
+    pub fn set_top(&mut self, row0: u64) {
+        let row0 = row0.min(self.cursor_row0);
+        if row0 != self.top_row0 {
+            self.top_row0 = row0;
+            self.rows.clear();
+        }
+    }
+
     /// 检测 tail 增长：文件变长且索引此前已到 EOF 时，使其重新可扩展。
     fn refresh_tail(&mut self) {
         let len = self.src.refresh_len();
