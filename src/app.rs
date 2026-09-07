@@ -479,7 +479,9 @@ impl App {
                     }
                 }
             }
-            let fj = a.pending_first && !a.matches.is_empty();
+            // 首次定位等待搜索完成（结果集完整）后才执行：
+            // 反向搜索的“最后一个匹配”与正向的边界都依赖完整结果，流式部分结果会导致跳错。
+            let fj = a.pending_first && a.done && !a.matches.is_empty();
             if fj {
                 a.pending_first = false;
             }
