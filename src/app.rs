@@ -1781,7 +1781,7 @@ impl App {
                 self.set_msg(format!("搜索: {pattern} …"));
             }
             Err(e) => {
-                self.set_msg(format!("rg 启动失败: {e}（请确认 PATH 中有 rg）"));
+                self.set_msg(format!("搜索启动失败: {e}"));
             }
         }
     }
