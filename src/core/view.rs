@@ -17,6 +17,8 @@ use crate::core::index::LineIndex;
 use crate::core::lines::LineReader;
 
 pub const DEFAULT_MAX_ROW: usize = 4096;
+/// UTF-16 全量内存转码的源文件大小上限（默认 512MB）。
+pub const DEFAULT_UTF16_INMEM_LIMIT: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ViewRow {
@@ -94,11 +96,32 @@ impl FileView {
     }
 
     pub fn open_with<P: AsRef<Path>>(path: P, max_row_bytes: usize) -> io::Result<Self> {
+        Self::open_with_limits(path, max_row_bytes, Some(DEFAULT_UTF16_INMEM_LIMIT))
+    }
+
+    /// utf16_limit：UTF-16 文件允许全量内存转码的源字节数上限（None = 不限）。
+    pub fn open_with_limits<P: AsRef<Path>>(
+        path: P,
+        max_row_bytes: usize,
+        utf16_limit: Option<u64>,
+    ) -> io::Result<Self> {
         let detected = detect_encoding(path.as_ref());
         let label = detected.name().to_ascii_lowercase();
         // UTF-16：全量流式转码为 UTF-8 内存流（行结构 1:1 保持），再交给字节行引擎。
         let (src, encoding) = if detected == UTF_16LE || detected == UTF_16BE {
             let raw = std::fs::read(path.as_ref())?;
+            if let Some(lim) = utf16_limit {
+                if raw.len() as u64 > lim {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "UTF-16 文件过大（{}MB）超出内存转码上限（{}MB）。请转 UTF-8 后查看，或调大 [misc].utf16_buffer_mb 再试。",
+                            raw.len() / (1024 * 1024),
+                            lim / (1024 * 1024)
+                        ),
+                    ));
+                }
+            }
             let (cow, _, _) = detected.decode(&raw); // 自动剥离 BOM
             (FileSource::from_bytes(cow.into_owned().into_bytes()), UTF_8)
         } else {
@@ -585,6 +608,22 @@ mod tests {
         assert_eq!(v.rows()[0].text, "甲行");
         assert_eq!(v.rows()[1].text, "第二行 hello");
         assert_eq!(v.rows()[2].text, "丙");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn utf16_over_limit_rejected() {
+        let p = tmp_path("viewutf16big");
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in "一二三四五六七八九十\n".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(&p, &bytes).unwrap();
+        let msg = match FileView::open_with_limits(&p, 4096, Some(8)) {
+            Ok(_) => panic!("应拒绝超限 UTF-16 文件"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("UTF-16"), "{msg}");
         std::fs::remove_file(&p).ok();
     }
 

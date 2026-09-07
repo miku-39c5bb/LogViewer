@@ -205,11 +205,15 @@ pub struct Pane {
 }
 
 impl Pane {
-    fn file(id: u64, path: &str) -> io::Result<Self> {
+    fn file(id: u64, path: &str, utf16_limit: u64) -> io::Result<Self> {
         Ok(Pane {
             id,
             content: Content::File(FileContent {
-                view: FileView::open(path)?,
+                view: FileView::open_with_limits(
+                    path,
+                    crate::core::view::DEFAULT_MAX_ROW,
+                    Some(utf16_limit),
+                )?,
                 search: None,
                 hl: None,
                 inner_h: 24,
@@ -310,11 +314,6 @@ pub struct App {
 
 impl App {
     pub fn open(path: &str) -> io::Result<Self> {
-        let mut pane = Pane::file(1, path)?;
-        // 打开即预填首屏，避免空窗闪烁
-        if let Content::File(fc) = &mut pane.content {
-            fc.view.fill_to(24);
-        }
         let (history, cfg) = match History::default_path() {
             Some(hp) => {
                 let cfg_path = hp.with_file_name("config.toml");
@@ -323,7 +322,7 @@ impl App {
                         let _ = std::fs::create_dir_all(dir);
                     }
                     let tpl = format!(
-                        "{}\n{}\n# 搜索历史最多保留条数（1-100000）\n[history]\ncap = {}\n",
+                        "{}\n{}\n# 搜索历史最多保留条数（1-100000）\n[history]\ncap = {}\n\n# UTF-16 文件全量内存转码的源文件大小上限(MB，超出会拒绝打开并提示)\n[misc]\nutf16_buffer_mb = 512\n",
                         crate::keymap::Keymap::default_template(),
                         crate::theme::Theme::template_text(),
                         crate::history::DEFAULT_HISTORY_CAP
@@ -344,6 +343,23 @@ impl App {
                 .unwrap_or_else(crate::theme::Theme::default),
             None => crate::theme::Theme::default(),
         };
+        // [misc].utf16_buffer_mb：UTF-16 内存转码上限（MB）
+        let utf16_limit = cfg
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| t.parse::<toml::Table>().ok())
+            .and_then(|t| {
+                t.get("misc")
+                    .and_then(|v| v.get("utf16_buffer_mb"))
+                    .and_then(|v| v.as_integer())
+            })
+            .map(|mb| (mb.clamp(16, 16 * 1024) as u64) << 20)
+            .unwrap_or(crate::core::view::DEFAULT_UTF16_INMEM_LIMIT);
+        let mut pane = Pane::file(1, path, utf16_limit)?;
+        // 打开即预填首屏，避免空窗闪烁
+        if let Content::File(fc) = &mut pane.content {
+            fc.view.fill_to(24);
+        }
         Ok(Self {
             panes: vec![pane],
             layout: crate::layout::Layout::new(1),
