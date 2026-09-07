@@ -6,7 +6,7 @@
 
 ### 依赖
 - Rust 工具链（stable）。
-- `rg`（ripgrep）需在 `PATH` 中（程序以外部进程调用它）。
+- ~~`rg`（ripgrep）需在 `PATH` 中（程序以外部进程调用它）。~~
 
 ### 构建
 
