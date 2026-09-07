@@ -288,6 +288,8 @@ pub struct App {
     follow: bool,
     /// 可配置键位表（config.toml）
     keys: crate::keymap::Keymap,
+    /// 主题（颜色 / 光标形状）
+    theme: crate::theme::Theme,
     /// 搜索选项
     opts: SearchPrefs,
     /// 耗时跳转任务（分片）
@@ -321,8 +323,9 @@ impl App {
                         let _ = std::fs::create_dir_all(dir);
                     }
                     let tpl = format!(
-                        "{}\n# 搜索历史最多保留条数（1-100000）\n[history]\ncap = {}\n",
+                        "{}\n{}\n# 搜索历史最多保留条数（1-100000）\n[history]\ncap = {}\n",
                         crate::keymap::Keymap::default_template(),
+                        crate::theme::Theme::template_text(),
                         crate::history::DEFAULT_HISTORY_CAP
                     );
                     let _ = std::fs::write(&cfg_path, tpl);
@@ -333,6 +336,14 @@ impl App {
             None => (History::in_memory(), None),
         };
         let keys = crate::keymap::Keymap::load_or_default(cfg.as_deref());
+        let theme = match &cfg {
+            Some(p) => std::fs::read_to_string(p)
+                .ok()
+                .and_then(|t| t.parse::<toml::Table>().ok())
+                .map(|t| crate::theme::Theme::from_toml(&t))
+                .unwrap_or_else(crate::theme::Theme::default),
+            None => crate::theme::Theme::default(),
+        };
         Ok(Self {
             panes: vec![pane],
             layout: crate::layout::Layout::new(1),
@@ -341,6 +352,7 @@ impl App {
             zoom: None,
             follow: false,
             keys,
+            theme,
             opts: SearchPrefs {
                 case: crate::search::Case::Smart,
                 word: false,
@@ -372,6 +384,7 @@ impl App {
     fn event_loop(&mut self, term: &mut ratatui::DefaultTerminal) -> io::Result<()> {
         loop {
             term.draw(|f| self.render(f))?;
+            self.sync_cursor_shape();
             if self.quit {
                 return Ok(());
             }
@@ -384,6 +397,39 @@ impl App {
             }
             self.on_tick();
         }
+    }
+
+    /// 按主题配置设置系统光标形状（输入模式与普通模式不同）。
+    fn sync_cursor_shape(&mut self) {
+        use crate::theme::CursorShape;
+        use crossterm::cursor::{self, SetCursorStyle};
+        use crossterm::QueueableCommand;
+        use std::io::Write;
+        let input = self.mode.is_cmd() || self.mode.is_goto() || self.mode.is_history();
+        let shape = if input {
+            self.theme.cursor_input
+        } else {
+            self.theme.cursor_normal
+        };
+        let mut out = std::io::stdout();
+        match shape {
+            CursorShape::Hidden => {
+                let _ = out.queue(cursor::Hide);
+            }
+            CursorShape::Block => {
+                let _ = out.queue(cursor::Show);
+                let _ = out.queue(SetCursorStyle::BlinkingBlock);
+            }
+            CursorShape::Underline => {
+                let _ = out.queue(cursor::Show);
+                let _ = out.queue(SetCursorStyle::BlinkingUnderScore);
+            }
+            CursorShape::Bar => {
+                let _ = out.queue(cursor::Show);
+                let _ = out.queue(SetCursorStyle::BlinkingBar);
+            }
+        }
+        let _ = out.flush();
     }
 
     fn on_tick(&mut self) {
@@ -1879,6 +1925,104 @@ impl App {
 // ---------- 渲染 ----------
 
 impl App {
+    /// 文件窗 wrap：非文件尾时光标行首段保持可见（视觉 2/3 附近，不落在屏外）。
+    fn wrap_cursor_fit(fc: &mut FileContent, cols: usize) {
+        if !fc.wrap {
+            return;
+        }
+        let need = fc.inner_h.max(4);
+        let target = (need * 2) / 3;
+        for _ in 0..6 {
+            fc.view.fill_to(fc.inner_h);
+            let (prefix, seg_cur, idx) = {
+                let rows = fc.view.rows();
+                if rows.is_empty() {
+                    return;
+                }
+                let top = fc.view.top_line1();
+                let cur = fc.view.cursor_line1();
+                let idx = (cur - top) as usize;
+                if idx >= rows.len() || idx == 0 {
+                    return; // 光标位于首行，必然可见
+                }
+                let ln_w = (top + rows.len() as u64 - 1).to_string().len().max(4);
+                let budget = cols.saturating_sub(1 + ln_w + 1).max(4);
+                let mut prefix = 0usize;
+                for r in rows.iter().take(idx) {
+                    let t = r.text.as_str();
+                    prefix += if UnicodeWidthStr::width(t) <= budget {
+                        1
+                    } else {
+                        wrap_cols(t, budget).len()
+                    };
+                }
+                let t = rows[idx].text.as_str();
+                let seg_cur = if UnicodeWidthStr::width(t) <= budget {
+                    1
+                } else {
+                    wrap_cols(t, budget).len()
+                };
+                (prefix, seg_cur, idx)
+            };
+            let want = if seg_cur <= need {
+                (need - seg_cur).min(target)
+            } else {
+                0
+            };
+            if prefix <= want {
+                return;
+            }
+            let avg = (prefix / idx).max(1);
+            let drop = ((prefix - want) as f64 / avg as f64).ceil() as u64;
+            let t = (fc.view.top_line1() - 1) + drop;
+            fc.view.set_top(t);
+        }
+    }
+
+    /// 子窗（匹配列表）wrap：非末尾时选中行保持可见。
+    fn wrap_list_cursor_fit(mc: &mut MatchesContent, cols: usize) {
+        if !mc.wrap || mc.rows.is_empty() {
+            return;
+        }
+        let last = mc.rows.len() - 1;
+        if mc.sel == last || mc.sel <= mc.top {
+            return;
+        }
+        let need = mc.inner_h.max(4);
+        let target = (need * 2) / 3;
+        let ln_w = mc.rows[last].line_no.to_string().len().max(4);
+        let budget = cols.saturating_sub(1 + ln_w + 1).max(4);
+        let seg_of = |t: &str| -> usize {
+            if UnicodeWidthStr::width(t) <= budget {
+                1
+            } else {
+                wrap_cols(t, budget).len()
+            }
+        };
+        for _ in 0..6 {
+            if mc.sel <= mc.top {
+                return;
+            }
+            let idx = mc.sel - mc.top;
+            let mut prefix = 0usize;
+            for k in mc.top..mc.sel {
+                prefix += seg_of(mc.rows[k].text.as_str());
+            }
+            let seg_cur = seg_of(mc.rows[mc.sel].text.as_str());
+            let want = if seg_cur <= need {
+                (need - seg_cur).min(target)
+            } else {
+                0
+            };
+            if prefix <= want {
+                return;
+            }
+            let avg = (prefix / idx).max(1);
+            let drop = ((prefix - want) as f64 / avg as f64).ceil() as usize;
+            mc.top = (mc.top + drop).min(mc.sel);
+        }
+    }
+
     /// 子窗（匹配列表）wrap 模式：选中行位于列表末尾时，把 top 调整到视觉行贴住列表尾部。
     fn wrap_list_bottom_fit(mc: &mut MatchesContent, cols: usize) {
         if !mc.wrap || mc.rows.is_empty() {
@@ -2028,17 +2172,30 @@ impl App {
             if let Content::File(fc) = &mut self.panes[*idx].content {
                 fc.inner_h = inner_h;
                 fc.view.fill_to(inner_h);
-                // wrap 且光标在文件尾部时：把视口贴住文件尾（视觉行对齐）
                 if fc.wrap {
-                    Self::wrap_tail_fit(fc, rect.width.saturating_sub(2).max(1) as usize);
+                    let cols = rect.width.saturating_sub(2).max(1) as usize;
+                    let tail = fc
+                        .view
+                        .known_total()
+                        .map(|t| fc.view.cursor_line1() >= t)
+                        .unwrap_or(false);
+                    if tail {
+                        Self::wrap_tail_fit(fc, cols);
+                    } else {
+                        Self::wrap_cursor_fit(fc, cols);
+                    }
                 }
             }
             if let Content::Matches(mc) = &mut self.panes[*idx].content {
                 mc.inner_h = inner_h;
                 mc.keep_visible();
-                // wrap 且选中行在列表末尾：视口视觉行贴底
                 if mc.wrap {
-                    Self::wrap_list_bottom_fit(mc, rect.width.saturating_sub(2).max(1) as usize);
+                    let cols = rect.width.saturating_sub(2).max(1) as usize;
+                    if mc.rows.is_empty() || mc.sel == mc.rows.len() - 1 {
+                        Self::wrap_list_bottom_fit(mc, cols);
+                    } else {
+                        Self::wrap_list_cursor_fit(mc, cols);
+                    }
                 }
             }
         }
@@ -2076,9 +2233,11 @@ impl App {
             .borders(Borders::ALL)
             .title(title)
             .border_style(if focused {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(self.theme.focus_border)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(self.theme.inactive_border)
             });
         let content = match &self.panes[idx].content {
             Content::File(fc) => self.file_lines(fc, rect.width.saturating_sub(2).max(1)),
@@ -2099,17 +2258,26 @@ impl App {
         wrap: bool,
         budget_first: usize,
         hl: Option<&Regex>,
+        theme: &crate::theme::Theme,
     ) {
         let marker = |c: bool| -> Span<'static> {
             Span::styled(
                 if c { "▶" } else { " " },
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::new().fg(theme.cursor_marker).add_modifier(Modifier::BOLD),
             )
         };
         let no_span = || -> Span<'static> {
             Span::styled(
                 format!("{no_text:>no_width$}│"),
-                Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                Style::new()
+                    .fg(theme.line_number)
+                    .add_modifier(Modifier::DIM),
+            )
+        };
+        let ln_dim = || -> Span<'static> {
+            Span::styled(
+                " ".repeat(no_width),
+                Style::new().fg(theme.line_number),
             )
         };
         if wrap {
@@ -2133,6 +2301,9 @@ impl App {
             if !rest.is_empty() {
                 segs.push(rest);
             }
+            if segs.is_empty() {
+                segs.push(""); // 空行也需占一行显示
+            }
             for (k, seg) in segs.into_iter().enumerate() {
                 let mut spans = Vec::new();
                 if k == 0 {
@@ -2142,24 +2313,25 @@ impl App {
                     // 续行：↪ 顶最左 + 空行号区 + │ 延续竖线，文本与首行内容左对齐
                     spans.push(Span::styled(
                         "↪",
-                        Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                        Style::new()
+                            .fg(theme.line_number)
+                            .add_modifier(Modifier::DIM),
                     ));
-                    spans.push(Span::styled(
-                        " ".repeat(no_width),
-                        Style::new().fg(Color::DarkGray),
-                    ));
+                    spans.push(ln_dim());
                     spans.push(Span::styled(
                         "│",
-                        Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                        Style::new()
+                            .fg(theme.line_number)
+                            .add_modifier(Modifier::DIM),
                     ));
                 }
-                append_highlighted(&mut spans, seg, hl, cur);
+                append_highlighted(&mut spans, seg, hl, cur, theme);
                 out.push(Line::from(spans));
             }
         } else {
             let seg = slice_cols(text, hscroll, budget_first);
             let mut spans = vec![marker(cur), no_span()];
-            append_highlighted(&mut spans, seg, hl, cur);
+            append_highlighted(&mut spans, seg, hl, cur, theme);
             out.push(Line::from(spans));
         }
     }
@@ -2185,6 +2357,7 @@ impl App {
                 fc.wrap,
                 budget1,
                 fc.hl.as_ref(),
+                &self.theme,
             );
         }
         lines
@@ -2224,6 +2397,7 @@ impl App {
                 mc.wrap,
                 budget1,
                 hl_re.as_ref(),
+                &self.theme,
             );
         }
         lines
@@ -2346,7 +2520,7 @@ impl App {
         lines.push(Line::from(vec![
             Span::styled(
                 "历史搜索  ",
-                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                Style::new().fg(self.theme.panel_border).add_modifier(Modifier::BOLD),
             ),
             Span::styled(filter.clone(), Style::new().fg(Color::White)),
             Span::styled(
@@ -2372,14 +2546,16 @@ impl App {
                 let text = &items[idx];
                 let mut spans = vec![Span::styled(
                     if cur { "▶ " } else { "  " },
-                    Style::new().fg(Color::Cyan),
+                    Style::new().fg(self.theme.cursor_marker),
                 )];
                 spans.push(Span::styled(
                     format!("{idx:>3}  "),
                     Style::new().fg(Color::DarkGray),
                 ));
                 let st2 = if cur {
-                    Style::new().bg(Color::Blue).fg(Color::White)
+                    Style::new()
+                        .bg(self.theme.cursor_line_bg)
+                        .fg(Color::White)
                 } else {
                     Style::new().fg(Color::Gray)
                 };
@@ -2396,7 +2572,7 @@ impl App {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" 历史关键字（模糊匹配） ")
-            .border_style(Style::default().fg(Color::Magenta));
+            .border_style(Style::default().fg(self.theme.panel_border));
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 
@@ -2405,7 +2581,9 @@ impl App {
         lines.push(Line::from(vec![
             Span::styled(
                 "logviewer 帮助（键位来自当前配置 config.toml，改动后重启生效）",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::new()
+                    .fg(self.theme.focus_border)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled("   Esc/q/空格/F1 关闭", Style::new().fg(Color::DarkGray)),
         ]));
@@ -2419,7 +2597,7 @@ impl App {
             lines.push(Line::from(vec![
                 Span::styled(label, Style::new().fg(Color::White)),
                 Span::styled("    ", Style::new().fg(Color::DarkGray)),
-                Span::styled(keys, Style::new().fg(Color::Yellow)),
+                Span::styled(keys, Style::new().fg(self.theme.keyword)),
             ]));
         }
         if lines.len() < max_rows {
@@ -2432,7 +2610,7 @@ impl App {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" 键位帮助 ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(Style::default().fg(self.theme.panel_border));
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 
@@ -2442,7 +2620,9 @@ impl App {
             format!(
                 "结果放入 →  h/j/k/l = 新窗在焦点窗左/下/上/右（Enter 默认右侧） | 1-{n} 覆盖（1 为文件窗） | Esc 取消"
             ),
-            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(self.theme.panel_border)
+                .add_modifier(Modifier::BOLD),
         ));
         frame.render_widget(Paragraph::new(line), area);
     }
@@ -2451,7 +2631,10 @@ impl App {
         let Mode::Goto(gs) = &self.mode else {
             return;
         };
-        let mut spans = vec![Span::styled(":", Style::new().fg(Color::Cyan))];
+        let mut spans = vec![Span::styled(
+            ":",
+            Style::new().fg(self.theme.cursor_marker),
+        )];
         spans.push(Span::styled(&gs.buf, Style::new().fg(Color::White)));
         let cur_style = Style::new().add_modifier(Modifier::REVERSED);
         if gs.cursor >= gs.buf.len() {
@@ -2480,10 +2663,17 @@ fn fuzzy_subseq(query: &str, text: &str) -> bool {
 }
 
 /// 将一行文本按高亮正则拆成带色 span。
-/// 行底色仅用于光标/选中行（蓝底）；其它匹配行不加底色，只高亮关键字。
-fn append_highlighted(spans: &mut Vec<Span>, text: &str, hl: Option<&Regex>, cur: bool) {
-    let base = Color::Gray;
-    let bg = if cur { Some(Color::Blue) } else { None };
+/// 行底色仅用于光标/选中行；其它匹配行不加底色，只高亮关键字。
+fn append_highlighted(
+    spans: &mut Vec<Span>,
+    text: &str,
+    hl: Option<&Regex>,
+    cur: bool,
+    theme: &crate::theme::Theme,
+) {
+    let base = if cur { Color::White } else { Color::Gray };
+    let bg = if cur { Some(theme.cursor_line_bg) } else { None };
+    let kw = theme.keyword;
     let mk = |s: String, fg: Color, bold: bool| -> Span {
         let mut st = Style::new().fg(fg);
         if let Some(b) = bg {
@@ -2502,7 +2692,7 @@ fn append_highlighted(spans: &mut Vec<Span>, text: &str, hl: Option<&Regex>, cur
                 if s > pos {
                     spans.push(mk(text[pos..s].to_string(), base, false));
                 }
-                spans.push(mk(text[s..e].to_string(), Color::Yellow, true));
+                spans.push(mk(text[s..e].to_string(), kw, true));
                 pos = e;
             }
             if pos < text.len() {

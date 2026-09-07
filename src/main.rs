@@ -6,6 +6,7 @@ mod history;
 mod keymap;
 mod layout;
 mod search;
+mod theme;
 
 use std::process::ExitCode;
 
