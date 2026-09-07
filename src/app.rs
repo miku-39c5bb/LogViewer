@@ -2259,6 +2259,7 @@ impl App {
         budget_first: usize,
         hl: Option<&Regex>,
         theme: &crate::theme::Theme,
+        kw: Color,
     ) {
         let marker = |c: bool| -> Span<'static> {
             Span::styled(
@@ -2325,13 +2326,13 @@ impl App {
                             .add_modifier(Modifier::DIM),
                     ));
                 }
-                append_highlighted(&mut spans, seg, hl, cur, theme);
+                append_highlighted(&mut spans, seg, hl, cur, theme, kw);
                 out.push(Line::from(spans));
             }
         } else {
             let seg = slice_cols(text, hscroll, budget_first);
             let mut spans = vec![marker(cur), no_span()];
-            append_highlighted(&mut spans, seg, hl, cur, theme);
+            append_highlighted(&mut spans, seg, hl, cur, theme, kw);
             out.push(Line::from(spans));
         }
     }
@@ -2340,6 +2341,8 @@ impl App {
         let top = fc.view.top_line1();
         let rows = fc.view.rows();
         let cursor_line1 = fc.view.cursor_line1();
+        // 行内匹配高亮色由 [theme].keyword 配置
+        let kw = self.theme.keyword;
         let ln_w = top.saturating_add(rows.len() as u64).to_string().len().max(4);
         let cols = cols as usize;
         let budget1 = cols.saturating_sub(1 + ln_w + 1).max(4);
@@ -2358,6 +2361,7 @@ impl App {
                 budget1,
                 fc.hl.as_ref(),
                 &self.theme,
+                kw,
             );
         }
         lines
@@ -2384,6 +2388,8 @@ impl App {
         let cols = cols as usize;
         let budget1 = cols.saturating_sub(1 + ln_w + 1).max(4);
         let mut lines = Vec::new();
+        // 行内匹配高亮色由 [theme].keyword 配置
+        let kw = self.theme.keyword;
         for ri in mc.top..end {
             let m = &mc.rows[ri];
             let cur = ri == mc.sel;
@@ -2398,6 +2404,7 @@ impl App {
                 budget1,
                 hl_re.as_ref(),
                 &self.theme,
+                kw,
             );
         }
         lines
@@ -2470,10 +2477,19 @@ impl App {
         } else if !self.msg.is_empty() {
             text.push_str(&format!("   {msg}", msg = self.msg));
         }
-        let line = Line::from(Span::styled(
-            text,
-            Style::new().add_modifier(Modifier::REVERSED),
-        ));
+        let st = if self.theme.status_fg.is_some() || self.theme.status_bg.is_some() {
+            let mut s = Style::new();
+            if let Some(f) = self.theme.status_fg {
+                s = s.fg(f);
+            }
+            if let Some(b) = self.theme.status_bg {
+                s = s.bg(b);
+            }
+            s
+        } else {
+            Style::new().add_modifier(Modifier::REVERSED)
+        };
+        let line = Line::from(Span::styled(text, st));
         frame.render_widget(Paragraph::new(line), area);
     }
 
@@ -2482,22 +2498,24 @@ impl App {
             return;
         };
         let prompt = if cs.forward { "/" } else { "?" };
-        let mut spans = vec![Span::styled(
-            prompt,
-            Style::new().fg(if cs.forward { Color::Green } else { Color::Yellow }),
-        )];
+        // 输入的关键字与提示符同色（/ 用 prompt_fwd，? 用 prompt_back）
+        let col = if cs.forward {
+            self.theme.prompt_fwd
+        } else {
+            self.theme.prompt_back
+        };
+        let mut spans = vec![Span::styled(prompt, Style::new().fg(col))];
         let cut = cs.cursor.min(cs.buf.len());
         let before = &cs.buf[..cut];
         let after = &cs.buf[cut..];
-        spans.push(Span::styled(before, Style::new().fg(Color::White)));
-        let cur_style = Style::new().add_modifier(Modifier::REVERSED);
+        spans.push(Span::styled(before, Style::new().fg(col)));
+        let cur_style = Style::new()
+            .fg(col)
+            .add_modifier(Modifier::REVERSED);
         match after.chars().next() {
             Some(c) => {
                 spans.push(Span::styled(c.to_string(), cur_style));
-                spans.push(Span::styled(
-                    &after[c.len_utf8()..],
-                    Style::new().fg(Color::White),
-                ));
+                spans.push(Span::styled(&after[c.len_utf8()..], Style::new().fg(col)));
             }
             None => {
                 spans.push(Span::styled(" ", cur_style));
@@ -2663,17 +2681,21 @@ fn fuzzy_subseq(query: &str, text: &str) -> bool {
 }
 
 /// 将一行文本按高亮正则拆成带色 span。
-/// 行底色仅用于光标/选中行；其它匹配行不加底色，只高亮关键字。
+/// 行底色仅用于光标/选中行；kw 为关键字高亮色（与提示符色一致时可传 prompt 色）。
 fn append_highlighted(
     spans: &mut Vec<Span>,
     text: &str,
     hl: Option<&Regex>,
     cur: bool,
     theme: &crate::theme::Theme,
+    kw: Color,
 ) {
-    let base = if cur { Color::White } else { Color::Gray };
+    let base = if cur {
+        theme.cursor_line_text
+    } else {
+        theme.text
+    };
     let bg = if cur { Some(theme.cursor_line_bg) } else { None };
-    let kw = theme.keyword;
     let mk = |s: String, fg: Color, bold: bool| -> Span {
         let mut st = Style::new().fg(fg);
         if let Some(b) = bg {
