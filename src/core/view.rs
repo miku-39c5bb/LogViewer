@@ -10,7 +10,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use encoding_rs::{Encoding, GBK, UTF_8};
+use encoding_rs::{Encoding, GB18030, UTF_8};
 
 use crate::core::file::FileSource;
 use crate::core::index::LineIndex;
@@ -32,7 +32,7 @@ pub struct FileView {
     src: FileSource,
     path: PathBuf,
     index: LineIndex,
-    /// 内容编码（探测：UTF-8 优先，失败回退 GBK）
+    /// 内容编码（探测：UTF-8 优先；无 BOM 中文回退 GB18030，兼容 GBK/GB2312）
     encoding: &'static Encoding,
     /// 视口首行行号（0-based）
     top_row0: u64,
@@ -49,7 +49,8 @@ pub struct FileView {
     last_len: u64,
 }
 
-/// 探测文件文本编码：UTF-8 可严格解码则 UTF-8，否则回退 GBK（Windows 中文日志常见）。
+/// 探测文件文本编码：UTF-8 可严格解码（或仅末尾截断）则 UTF-8；
+/// 否则回退 GB18030——它兼容解码 GBK 与 GB2312 字节流（Windows 中文日志常见）。
 fn detect_encoding(path: &Path) -> &'static Encoding {
     let mut head = [0u8; 4096];
     let n = std::fs::File::open(path)
@@ -65,7 +66,17 @@ fn detect_encoding(path: &Path) -> &'static Encoding {
         // 仅"末尾不完整序列"（error_len == None，4096 字节截断在字符中间）仍视为 UTF-8；
         // 字节流中间出现非法序列才回退 GBK
         Err(e) if e.error_len().is_none() => UTF_8,
-        Err(_) => GBK,
+        Err(_) => GB18030,
+    }
+}
+
+/// 按编码解码一行字节（UTF-8 lossy；其它编码 lossy）。
+pub(crate) fn decode_text(enc: &'static Encoding, bytes: &[u8]) -> String {
+    if enc == UTF_8 {
+        String::from_utf8_lossy(bytes).into_owned()
+    } else {
+        let (cow, _, _) = enc.decode(bytes);
+        cow.into_owned()
     }
 }
 
@@ -97,23 +108,14 @@ impl FileView {
         &self.path
     }
 
-    /// 行内容解码入口：按探测到的编码解码（UTF-8 lossy 或 GBK lossy）。
+    /// 行内容解码入口：按探测到的编码解码。
     fn decode_bytes(&self, bytes: &[u8]) -> String {
-        if self.encoding == GBK {
-            let (cow, _, _) = GBK.decode(bytes);
-            cow.into_owned()
-        } else {
-            String::from_utf8_lossy(bytes).into_owned()
-        }
+        decode_text(self.encoding, bytes)
     }
 
-    /// 给 rg 用的编码标签（小写）。
+    /// 给搜索层用的编码标签（小写 canonical 名）。
     pub fn encoding_label(&self) -> String {
-        if self.encoding == GBK {
-            "gbk".to_string()
-        } else {
-            "utf-8".to_string()
-        }
+        self.encoding.name().to_ascii_lowercase()
     }
 
     pub fn file_len(&self) -> u64 {
@@ -359,12 +361,7 @@ impl FileView {
         while self.rows.len() < need {
             match lr.next_row() {
                 Some((off2, bytes, trunc)) => {
-                    let text = if enc == GBK {
-                        let (cow, _, _) = GBK.decode(&bytes);
-                        cow.into_owned()
-                    } else {
-                        String::from_utf8_lossy(&bytes).into_owned()
-                    };
+                    let text = decode_text(enc, &bytes);
                     self.rows.push(ViewRow {
                         offset: off2,
                         text,

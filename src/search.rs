@@ -1,13 +1,15 @@
 //! 内嵌搜索：不再依赖外部 rg 进程。
 //!
-//! - UTF-8 文件：用 grep-searcher + grep-regex（与 ripgrep 同源引擎，字节级多线程/流式搜索）；
-//! - GBK 等非 UTF-8 文件：复用 core 的行读取器，按行解码后再用 regex 匹配（引擎一致，速度较慢）；
-//! - 取消：后台线程 + `AtomicBool` 标志（UI 侧设置后，引擎在下一个匹配/行处停止）。
+//! - UTF-8 文件：用 grep-searcher + grep-regex（与 ripgrep 同源引擎，字节级流式搜索）；
+//! - 非 UTF-8（GB18030 等，兼容 GBK / GB2312）：`TranscodingReader` 增量转码为 UTF-8
+//!   后再走同一引擎，编码正确且仍享受引擎级速度与流式/取消；
+//! - 取消：后台线程 + `AtomicBool` 标志（UI 侧设置后，引擎在下一个匹配处停止）。
 //!
 //! 对外接口保持与旧版一致：`RgSearch::start(..)` 返回带 channel 的句柄，
 //! 通过 `RgMsg::{Match,Done,Error}` 流式上报匹配。
 
 use std::io;
+use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::Arc;
@@ -181,6 +183,87 @@ impl RgSearch {
     }
 }
 
+
+/// 流式转码 Reader：把非 UTF-8 文件字节流增量解码为 UTF-8 流（保行结构），喂给引擎。
+struct TranscodingReader {
+    file: std::fs::File,
+    dec: encoding_rs::Decoder,
+    src_buf: Vec<u8>,
+    pending: Vec<u8>,
+    pend_pos: usize,
+    finished: bool,
+}
+
+impl TranscodingReader {
+    fn new(file: std::fs::File, enc: &'static encoding_rs::Encoding) -> Self {
+        TranscodingReader {
+            file,
+            dec: enc.new_decoder(),
+            src_buf: vec![0u8; 16 * 1024],
+            pending: Vec::new(),
+            pend_pos: 0,
+            finished: false,
+        }
+    }
+
+    fn drain_tail(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        // 以 last=true 通知解码器输入流结束，处理截断在尾部的半字符
+        let mut buf = [0u8; 256];
+        loop {
+            let (_, _, u, _) = self.dec.decode_to_utf8(&[], &mut buf, true);
+            if u == 0 {
+                break;
+            }
+            self.pending.extend_from_slice(&buf[..u]);
+        }
+    }
+}
+
+impl std::io::Read for TranscodingReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.pend_pos < self.pending.len() {
+                let n = (self.pending.len() - self.pend_pos).min(out.len());
+                out[..n].copy_from_slice(&self.pending[self.pend_pos..self.pend_pos + n]);
+                self.pend_pos += n;
+                return Ok(n);
+            }
+            // 已输出区段清空
+            self.pending.clear();
+            self.pend_pos = 0;
+            if self.finished {
+                return Ok(0);
+            }
+            let n = self.file.read(&mut self.src_buf)?;
+            if n == 0 {
+                self.drain_tail();
+                continue;
+            }
+            // 增量解码整块输入（GB18030/GBK 到 UTF-8 放大倍数 < 4，一次 scratch 足够）
+            let mut scratch = vec![0u8; self.src_buf.len() * 4 + 64];
+            let mut consumed = 0usize;
+            while consumed < n {
+                let (_, c, u, _) = self
+                    .dec
+                    .decode_to_utf8(&self.src_buf[consumed..n], &mut scratch, false);
+                if c == 0 {
+                    if u == 0 {
+                        break; // 防御：无进展
+                    }
+                    scratch.resize(scratch.len() * 2, 0);
+                    continue;
+                }
+                consumed += c;
+                self.pending.extend_from_slice(&scratch[..u]);
+            }
+        }
+    }
+}
+
 fn run_search(
     path: &str,
     pattern: &str,
@@ -190,50 +273,10 @@ fn run_search(
     cancel: Arc<AtomicBool>,
     tx: Sender<RgMsg>,
 ) {
-    if encoding.eq_ignore_ascii_case("utf-8") {
-        match matcher_for(pattern, case, word) {
-            Ok(m) => {
-                let mut sink = ReportSink {
-                    tx: tx.clone(),
-                    cancel: cancel.clone(),
-                    count: 0,
-                };
-                let mut searcher = SearcherBuilder::new().line_number(true).build();
-                if let Err(e) = searcher.search_path(m, path, &mut sink) {
-                    let _ = tx.send(RgMsg::Error(e.to_string()));
-                }
-                let _ = tx.send(RgMsg::Done {
-                    count: sink.count,
-                    cancelled: cancel.load(Ordering::Relaxed),
-                });
-            }
-            Err(e) => {
-                let _ = tx.send(RgMsg::Error(e));
-                let _ = tx.send(RgMsg::Done {
-                    count: 0,
-                    cancelled: cancel.load(Ordering::Relaxed),
-                });
-            }
-        }
-    } else {
-        // 非 UTF-8（GBK 等）：复用行读取器，逐行解码后 regex 匹配
-        run_decoded_fallback(path, pattern, case, word, cancel, tx);
-    }
-}
-
-fn run_decoded_fallback(
-    path: &str,
-    pattern: &str,
-    case: Case,
-    word: bool,
-    cancel: Arc<AtomicBool>,
-    tx: Sender<RgMsg>,
-) {
-    use crate::core::file::FileSource;
-    use crate::core::lines::LineReader;
-
-    let re = match compile_regex(pattern, case, word) {
-        Ok(r) => r,
+    let enc = encoding_rs::Encoding::for_label(encoding.as_bytes())
+        .unwrap_or(encoding_rs::UTF_8);
+    let m = match matcher_for(pattern, case, word) {
+        Ok(m) => m,
         Err(e) => {
             let _ = tx.send(RgMsg::Error(e));
             let _ = tx.send(RgMsg::Done {
@@ -243,43 +286,32 @@ fn run_decoded_fallback(
             return;
         }
     };
-    let mut src = match FileSource::open(path) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = tx.send(RgMsg::Error(e.to_string()));
-            let _ = tx.send(RgMsg::Done {
-                count: 0,
-                cancelled: cancel.load(Ordering::Relaxed),
-            });
-            return;
+    let mut sink = ReportSink {
+        tx: tx.clone(),
+        cancel: cancel.clone(),
+        count: 0,
+    };
+    let mut searcher = SearcherBuilder::new().line_number(true).build();
+    let res = if enc == encoding_rs::UTF_8 {
+        searcher.search_path(m, path, &mut sink)
+    } else {
+        // 非 UTF-8（GB18030 等，兼容 GBK/GB2312）：流式转码为 UTF-8 后走引擎
+        match std::fs::File::open(path) {
+            Ok(f) => {
+                let rdr = TranscodingReader::new(f, enc);
+                searcher.search_reader(m, rdr, &mut sink)
+            }
+            Err(e) => Err(e),
         }
     };
-    let mut count: u64 = 0;
-    let mut line_no: u64 = 0;
-    let mut lr = LineReader::new(&mut src, 0, 1 << 20);
-    while let Some((_off, bytes, _trunc)) = lr.next_row() {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-        line_no += 1;
-        let text = encoding_rs::GBK.decode(&bytes).0.into_owned();
-        if re.is_match(&text) {
-            count += 1;
-            let _ = tx.send(RgMsg::Match(Match {
-                line_no,
-                text,
-            }));
-        }
+    if let Err(e) = res {
+        let _ = tx.send(RgMsg::Error(e.to_string()));
     }
     let _ = tx.send(RgMsg::Done {
-        count,
+        count: sink.count,
         cancelled: cancel.load(Ordering::Relaxed),
     });
 }
-
-/// 保留的按行读取辅助占位（兼容旧引用）。
-#[allow(unused)]
-fn _unused() {}
 
 #[cfg(test)]
 mod tests {
@@ -309,7 +341,50 @@ mod tests {
         assert_eq!(Case::Sensitive.label(), "区分");
     }
 
+    #[test]
+    fn end_to_end_gb18030() {
+        // GB18030 编码（兼容 GBK/GB2312 中文日志）：验证转码 Reader + 引擎路径
+        let text = "甲行\n第二行 hello\n丙\n";
+        let (bytes, _, _) = encoding_rs::GB18030.encode(text);
+        let p = tmpfile2(&bytes);
+        // 中文关键字（必须经转码后字节才能对上）
+        let s = RgSearch::start(
+            p.to_str().unwrap(),
+            "行",
+            "gb18030",
+            Case::Sensitive,
+            false,
+        )
+        .unwrap();
+        let (hits, done, _) = collect(&s);
+        assert!(done);
+        assert_eq!(
+            hits.iter().map(|x| x.0).collect::<Vec<_>>(),
+            vec![1, 2],
+            "hits={hits:?}"
+        );
+        // ASCII 关键字同样工作，行文本解码正确
+        let s = RgSearch::start(
+            p.to_str().unwrap(),
+            "hello",
+            "gb18030",
+            Case::Sensitive,
+            false,
+        )
+        .unwrap();
+        let (hits, done, _) = collect(&s);
+        assert!(done);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 2);
+        assert_eq!(hits[0].1, "第二行 hello", "hits={hits:?}");
+        std::fs::remove_file(&p).ok();
+    }
+
     fn tmpfile(content: &str) -> std::path::PathBuf {
+        tmpfile2(content.as_bytes())
+    }
+
+    fn tmpfile2(bytes: &[u8]) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(
             "lv_search_{}_{}.log",
             std::process::id(),
@@ -318,7 +393,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::write(&p, content).unwrap();
+        std::fs::write(&p, bytes).unwrap();
         p
     }
 
