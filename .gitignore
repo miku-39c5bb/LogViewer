@@ -2,3 +2,4 @@
 *.log
 build.bat
 build.ps1
+*.txt

@@ -144,6 +144,7 @@ pub struct ActiveSearch {
     runner: RgSearch,
     pattern: String,
     forward: bool,
+    /// 已收到的匹配（行号升序，来自搜索引擎；文本保留供结果窗与状态显示）
     matches: Vec<Match>,
     done: bool,
     /// 搜索提交后的首次定位尚未执行（等收到首批匹配后跳一次）
@@ -1201,24 +1202,24 @@ impl App {
         self.zoom = if self.zoom == Some(id) { None } else { Some(id) };
     }
 
-    /// 把焦点窗格当前内容导出为文件（主窗=搜索结果；匹配窗=列表）。
+    /// 按行号读取主文件窗对应行原文（文本按需读取的统一入口）。
+    fn main_read_line(&mut self, line1: u64) -> Option<String> {
+        let Content::File(fc) = &mut self.panes[0].content else {
+            return None;
+        };
+        fc.view.read_line_text(line1)
+    }
+
+    /// 把焦点窗格当前内容导出为文件（主窗=搜索结果；匹配窗=列表；文本按行读取，不驻留）。
     fn export_focus(&mut self) {
-        let rows: Vec<(u64, String)> = match &self.panes[self.focus].content {
+        let lines: Vec<u64> = match &self.panes[self.focus].content {
             Content::File(fc) => match &fc.search {
-                Some(a) => a
-                    .matches
-                    .iter()
-                    .map(|m| (m.line_no, m.text.clone()))
-                    .collect(),
+                Some(a) => a.matches.iter().map(|m| m.line_no).collect(),
                 None => Vec::new(),
             },
-            Content::Matches(mc) => mc
-                .rows
-                .iter()
-                .map(|m| (m.line_no, m.text.clone()))
-                .collect(),
+            Content::Matches(mc) => mc.rows.iter().map(|m| m.line_no).collect(),
         };
-        if rows.is_empty() {
+        if lines.is_empty() {
             self.set_msg("没有可导出的内容（先搜索）");
             return;
         }
@@ -1227,13 +1228,14 @@ impl App {
             .unwrap()
             .as_secs();
         let name = format!("logviewer_export_{nanos}.txt");
-        let mut out = String::with_capacity(rows.len() * 64);
-        for (line, text) in &rows {
+        let mut out = String::new();
+        for line in &lines {
+            let text = self.main_read_line(*line).unwrap_or_default();
             out.push_str(&format!("{line}: {text}\n"));
         }
         match std::fs::write(&name, out) {
             Ok(()) => {
-                let n = rows.len();
+                let n = lines.len();
                 self.set_msg(format!("已导出 {n} 行到 {name}（当前目录）"));
             }
             Err(e) => self.set_msg(format!("导出失败: {e}")),
@@ -1292,31 +1294,44 @@ impl App {
     /// `$`：跳到当前（光标/选中）行行尾（水平滚动到末尾可见）。
     fn pane_goto_eol(&mut self) {
         let cols = self.last_cols.max(10);
-        match &mut self.panes[self.focus].content {
-            Content::File(fc) => {
-                if fc.wrap {
-                    return;
-                }
-                let rows = fc.view.rows();
-                let cur = fc.view.cursor_line1();
-                let top = fc.view.top_line1();
-                if cur >= top {
-                    let i = (cur - top) as usize;
-                    if let Some(r) = rows.get(i) {
-                        let w = UnicodeWidthStr::width(r.text.as_str());
-                        fc.hscroll = w.saturating_sub(cols.saturating_sub(8));
-                    }
+        if self.focus == 0 {
+            let Content::File(fc) = &mut self.panes[0].content else {
+                return;
+            };
+            if fc.wrap {
+                return;
+            }
+            let rows = fc.view.rows();
+            let cur = fc.view.cursor_line1();
+            let top = fc.view.top_line1();
+            if cur >= top {
+                let i = (cur - top) as usize;
+                if let Some(r) = rows.get(i) {
+                    let w = UnicodeWidthStr::width(r.text.as_str());
+                    fc.hscroll = w.saturating_sub(cols.saturating_sub(8));
                 }
             }
-            Content::Matches(mc) => {
-                if mc.wrap {
-                    return;
-                }
-                if let Some(m) = mc.rows.get(mc.sel) {
-                    let w = UnicodeWidthStr::width(m.text.as_str());
-                    mc.hscroll = w.saturating_sub(cols.saturating_sub(8));
-                }
+            return;
+        }
+        // 匹配窗：行文本按需从主文件窗读取
+        let target = {
+            let Content::Matches(mc) = &self.panes[self.focus].content else {
+                return;
+            };
+            if mc.wrap {
+                return;
             }
+            mc.rows.get(mc.sel).map(|m| m.line_no)
+        };
+        let Some(no) = target else {
+            return;
+        };
+        let w = self
+            .main_read_line(no)
+            .map(|t| UnicodeWidthStr::width(t.as_str()))
+            .unwrap_or(0);
+        if let Content::Matches(mc) = &mut self.panes[self.focus].content {
+            mc.hscroll = w.saturating_sub(cols.saturating_sub(8));
         }
     }
 
@@ -1375,22 +1390,26 @@ impl MatchesContent {
         self.rows.get(self.sel).map(|m| m.line_no)
     }
 
-    /// 在当前列表中执行搜索（不破坏列表，仅记录匹配与游标）。
-    /// 返回 Ok(匹配数)；正则非法返回 Err。
+    /// 在当前列表中执行窗内搜索（不破坏列表；行文本按需从主视图读取）。
+    /// 返回 Ok(匹配数)；正则非法返回 Err。超大列表给出护栏错误。
     fn do_search(
         &mut self,
+        view: &mut FileView,
         pattern: &str,
         forward: bool,
         opts: &SearchPrefs,
     ) -> Result<usize, String> {
+        if self.rows.len() > 20_000 {
+            return Err("列表过大（>2 万行），窗内过滤略过；请回主窗用同一关键字搜索".to_string());
+        }
         let re = crate::search::compile_regex(pattern, opts.case, opts.word)?;
-        let match_idx: Vec<usize> = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| re.is_match(&m.text))
-            .map(|(i, _)| i)
-            .collect();
+        let mut match_idx: Vec<usize> = Vec::new();
+        for (i, m) in self.rows.iter().enumerate() {
+            let t = view.read_line_text(m.line_no).unwrap_or_default();
+            if re.is_match(&t) {
+                match_idx.push(i);
+            }
+        }
         if match_idx.is_empty() {
             self.search = None;
             return Ok(0);
@@ -1504,13 +1523,21 @@ impl App {
 
     /// 匹配窗执行窗内搜索（作用域 = 当前窗格；行为与主窗一致）
     fn matches_do_search(&mut self, pattern: &str, forward: bool) {
+        if self.focus == 0 {
+            return;
+        }
         let opts = self.opts;
         let result = {
-            let Content::Matches(mc) = &mut self.panes[self.focus].content else {
-                self.set_msg("该窗格不支持此搜索");
-                return;
-            };
-            mc.do_search(pattern, forward, &opts)
+            let (head, rest) = self.panes.split_at_mut(1);
+            match (
+                &mut head[0].content,
+                rest.get_mut(self.focus - 1).map(|p| &mut p.content),
+            ) {
+                (Content::File(pf), Some(Content::Matches(mc))) => {
+                    mc.do_search(&mut pf.view, pattern, forward, &opts)
+                }
+                _ => Err("该窗格不支持此搜索".to_string()),
+            }
         };
         match result {
             Ok(0) => self.set_msg(format!("窗内无匹配: {pattern}")),
@@ -1997,8 +2024,8 @@ impl App {
         }
     }
 
-    /// 子窗（匹配列表）wrap：非末尾时选中行保持可见。
-    fn wrap_list_cursor_fit(mc: &mut MatchesContent, cols: usize) {
+    /// 子窗（匹配列表）wrap：非末尾时选中行保持可见（文本按需从主视图读取）。
+    fn wrap_list_cursor_fit(mc: &mut MatchesContent, view: &mut FileView, cols: usize) {
         if !mc.wrap || mc.rows.is_empty() {
             return;
         }
@@ -2024,9 +2051,13 @@ impl App {
             let idx = mc.sel - mc.top;
             let mut prefix = 0usize;
             for k in mc.top..mc.sel {
-                prefix += seg_of(mc.rows[k].text.as_str());
+                let no = mc.rows[k].line_no;
+                let t = view.read_line_text(no).unwrap_or_default();
+                prefix += seg_of(&t);
             }
-            let seg_cur = seg_of(mc.rows[mc.sel].text.as_str());
+            let no_cur = mc.rows[mc.sel].line_no;
+            let cur_text = view.read_line_text(no_cur).unwrap_or_default();
+            let seg_cur = seg_of(&cur_text);
             let want = if seg_cur <= need {
                 (need - seg_cur).min(target)
             } else {
@@ -2042,7 +2073,7 @@ impl App {
     }
 
     /// 子窗（匹配列表）wrap 模式：选中行位于列表末尾时，把 top 调整到视觉行贴住列表尾部。
-    fn wrap_list_bottom_fit(mc: &mut MatchesContent, cols: usize) {
+    fn wrap_list_bottom_fit(mc: &mut MatchesContent, view: &mut FileView, cols: usize) {
         if !mc.wrap || mc.rows.is_empty() {
             return;
         }
@@ -2050,28 +2081,22 @@ impl App {
         if mc.sel != last {
             return; // 不在列表末尾
         }
-        let ln_w = mc
-            .rows
-            .iter()
-            .map(|m| m.line_no.to_string().len())
-            .max()
-            .unwrap_or(6)
-            .max(4);
+        // 大列表逐行读原文统计太慢：仅对 ≤1500 行的列表做精确贴底
+        if mc.rows.len() > 1500 {
+            return;
+        }
+        let ln_w = mc.rows[last].line_no.to_string().len().max(4);
         let budget = cols.saturating_sub(1 + ln_w + 1).max(4);
         let need = mc.inner_h.max(4);
-        // 每行 wrap 段数（一次性统计，供快速调整 top）
-        let segs: Vec<usize> = mc
-            .rows
-            .iter()
-            .map(|m| {
-                let t = m.text.as_str();
-                if UnicodeWidthStr::width(t) <= budget {
-                    1
-                } else {
-                    wrap_cols(t, budget).len()
-                }
-            })
-            .collect();
+        let mut segs: Vec<usize> = Vec::with_capacity(mc.rows.len());
+        for m in mc.rows.iter() {
+            let t = view.read_line_text(m.line_no).unwrap_or_default();
+            segs.push(if UnicodeWidthStr::width(t.as_str()) <= budget {
+                1
+            } else {
+                wrap_cols(t.as_str(), budget).len()
+            });
+        }
         let mut top = mc.top.min(last);
         for _ in 0..12 {
             let vs: usize = segs[top..].iter().sum();
@@ -2183,11 +2208,14 @@ impl App {
             self.render_status(frame, chunks[1]);
             return;
         }
-        // 1) 布局 + 预填充内容
+        // 1) 布局 + 预填充内容：先文件窗，再匹配窗（经主视图读取行文本）
         let visible = self.visible_panes(content_area);
         for (idx, rect) in visible.iter() {
+            if *idx != 0 {
+                continue;
+            }
             let inner_h = rect.height.saturating_sub(2).max(1) as usize;
-            if let Content::File(fc) = &mut self.panes[*idx].content {
+            if let Content::File(fc) = &mut self.panes[0].content {
                 fc.inner_h = inner_h;
                 fc.view.fill_to(inner_h);
                 if fc.wrap {
@@ -2204,24 +2232,38 @@ impl App {
                     }
                 }
             }
-            if let Content::Matches(mc) = &mut self.panes[*idx].content {
-                mc.inner_h = inner_h;
-                mc.keep_visible();
-                if mc.wrap {
-                    let cols = rect.width.saturating_sub(2).max(1) as usize;
-                    if mc.rows.is_empty() || mc.sel == mc.rows.len() - 1 {
-                        Self::wrap_list_bottom_fit(mc, cols);
-                    } else {
-                        Self::wrap_list_cursor_fit(mc, cols);
-                    }
+        }
+        for (idx, rect) in visible.iter() {
+            if *idx == 0 {
+                continue;
+            }
+            let inner_h = rect.height.saturating_sub(2).max(1) as usize;
+            let cols = rect.width.saturating_sub(2).max(1) as usize;
+            let (head, rest) = self.panes.split_at_mut(1);
+            let Content::File(pf) = &mut head[0].content else {
+                continue;
+            };
+            let rel = *idx - 1;
+            let Content::Matches(mc) = &mut rest[rel].content else {
+                continue;
+            };
+            mc.inner_h = inner_h;
+            mc.keep_visible();
+            if mc.wrap {
+                if mc.rows.is_empty() || mc.sel == mc.rows.len() - 1 {
+                    Self::wrap_list_bottom_fit(mc, &mut pf.view, cols);
+                } else {
+                    Self::wrap_list_cursor_fit(mc, &mut pf.view, cols);
                 }
             }
         }
         // 2) 收割（可能触发跳转重建视口，再次填充）
         self.harvest_file_search();
         for (idx, _rect) in visible.iter() {
-            if let Content::File(fc) = &mut self.panes[*idx].content {
-                fc.view.fill_to(fc.inner_h);
+            if *idx == 0 {
+                if let Content::File(fc) = &mut self.panes[0].content {
+                    fc.view.fill_to(fc.inner_h);
+                }
             }
         }
         // 3) 绘制各窗格
@@ -2257,9 +2299,24 @@ impl App {
             } else {
                 Style::default().fg(self.theme.inactive_border)
             });
-        let content = match &self.panes[idx].content {
-            Content::File(fc) => self.file_lines(fc, rect.width.saturating_sub(2).max(1)),
-            Content::Matches(mc) => self.matches_lines(mc, rect.width.saturating_sub(2).max(1)),
+        let cols = rect.width.saturating_sub(2).max(1);
+        let content = if idx == 0 {
+            let fc = match &self.panes[0].content {
+                Content::File(fc) => fc,
+                _ => return,
+            };
+            self.file_lines(fc, cols)
+        } else {
+            let (head, rest) = self.panes.split_at_mut(1);
+            match (
+                &mut head[0].content,
+                rest.get_mut(idx - 1).map(|p| &mut p.content),
+            ) {
+                (Content::File(pf), Some(Content::Matches(mc))) => {
+                    Self::build_matches_lines(&mut pf.view, mc, cols, &self.theme, self.opts)
+                }
+                _ => Vec::new(),
+            }
         };
         frame.render_widget(Paragraph::new(content).block(block), rect);
     }
@@ -2385,7 +2442,20 @@ impl App {
         lines
     }
 
-    fn matches_lines(&self, mc: &MatchesContent, cols: u16) -> Vec<Line<'static>> {
+    /// 结果窗渲染：按视口行号从主视图逐行读取原文后排版（文本不驻留）。
+    fn build_matches_lines(
+        view: &mut FileView,
+        mc: &MatchesContent,
+        cols: u16,
+        theme: &crate::theme::Theme,
+        opts: SearchPrefs,
+    ) -> Vec<Line<'static>> {
+        if mc.rows.is_empty() {
+            return vec![Line::from(Span::styled(
+                "(空)",
+                Style::new().fg(Color::DarkGray),
+            ))];
+        }
         let ln_w = mc
             .rows
             .last()
@@ -2393,35 +2463,29 @@ impl App {
             .unwrap_or(6)
             .max(4);
         let hl_re = match &mc.search {
-            Some(s) => crate::search::compile_regex(&s.query, self.opts.case, self.opts.word).ok(),
+            Some(s) => crate::search::compile_regex(&s.query, opts.case, opts.word).ok(),
             None => None,
         };
         let end = (mc.top + mc.inner_h).min(mc.rows.len());
-        if mc.rows.is_empty() {
-            return vec![Line::from(Span::styled(
-                "(空)",
-                Style::new().fg(Color::DarkGray),
-            ))];
-        }
         let cols = cols as usize;
         let budget1 = cols.saturating_sub(1 + ln_w + 1).max(4);
+        let kw = theme.keyword;
         let mut lines = Vec::new();
-        // 行内匹配高亮色由 [theme].keyword 配置
-        let kw = self.theme.keyword;
         for ri in mc.top..end {
-            let m = &mc.rows[ri];
+            let no = mc.rows[ri].line_no;
+            let text = view.read_line_text(no).unwrap_or_default();
             let cur = ri == mc.sel;
             Self::push_row_lines(
                 &mut lines,
-                m.line_no.to_string(),
+                no.to_string(),
                 ln_w,
                 cur,
-                &m.text,
+                &text,
                 mc.hscroll,
                 mc.wrap,
                 budget1,
                 hl_re.as_ref(),
-                &self.theme,
+                theme,
                 kw,
             );
         }

@@ -346,6 +346,19 @@ impl FileView {
         self.rows.clear();
     }
 
+    /// 按 1-based 行号读取该行文本（不改动视口/光标；需要时会同步扩展行索引）。
+    pub fn read_line_text(&mut self, line1: u64) -> Option<String> {
+        if line1 < 1 {
+            return None;
+        }
+        let row0 = line1 - 1;
+        let off = self.index.row_offset(&mut self.src, row0)?;
+        let enc = self.encoding;
+        let mut lr = LineReader::new(&mut self.src, off, self.max_row_bytes);
+        let (_, bytes, _) = lr.next_row()?;
+        Some(decode_text(enc, &bytes))
+    }
+
     /// 只调整视口顶行（不影响光标；clamp 不超过光标行）。
     pub fn set_top(&mut self, row0: u64) {
         let row0 = row0.min(self.cursor_row0);

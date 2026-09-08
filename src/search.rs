@@ -17,12 +17,10 @@ use std::sync::Arc;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Match {
-    /// 1-based 行号（与 rg 一致）
+    /// 1-based 行号（文本不驻留，显示时按需从原文件读取）
     pub line_no: u64,
-    /// 该行文本（已按文件编码解码）
-    pub text: String,
 }
 
 #[derive(Debug)]
@@ -128,13 +126,9 @@ struct ReportSink {
 }
 
 impl ReportSink {
-    fn report(&mut self, line_no: u64, text: &[u8]) {
+    fn report(&mut self, line_no: u64) {
         self.count += 1;
-        let mut text = String::from_utf8_lossy(text).into_owned();
-        while text.ends_with('\n') || text.ends_with('\r') {
-            text.pop();
-        }
-        let _ = self.tx.send(RgMsg::Match(Match { line_no, text }));
+        let _ = self.tx.send(RgMsg::Match(Match { line_no }));
     }
 }
 
@@ -146,7 +140,7 @@ impl Sink for ReportSink {
             return Ok(false);
         }
         if let Some(n) = mat.line_number() {
-            self.report(n, mat.bytes());
+            self.report(n);
         }
         Ok(true)
     }
@@ -461,7 +455,7 @@ mod tests {
         let (hits, done, _) = collect(&s);
         assert!(done);
         assert_eq!(
-            hits.iter().map(|x| x.0).collect::<Vec<_>>(),
+            hits,
             vec![1, 2],
             "hits={hits:?}"
         );
@@ -476,9 +470,7 @@ mod tests {
         .unwrap();
         let (hits, done, _) = collect(&s);
         assert!(done);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0, 2);
-        assert_eq!(hits[0].1, "第二行 hello", "hits={hits:?}");
+        assert_eq!(hits, vec![2], "hits={hits:?}");
         std::fs::remove_file(&p).ok();
     }
 
@@ -499,15 +491,13 @@ mod tests {
         p
     }
 
-    fn collect(
-        s: &RgSearch,
-    ) -> (Vec<(u64, String)>, bool, u64) {
+    fn collect(s: &RgSearch) -> (Vec<u64>, bool, u64) {
         let mut hits = Vec::new();
         let mut done = false;
         let mut count = 0;
         while let Ok(msg) = s.rx().recv() {
             match msg {
-                RgMsg::Match(m) => hits.push((m.line_no, m.text)),
+                RgMsg::Match(m) => hits.push(m.line_no),
                 RgMsg::Done { count: c, cancelled } => {
                     done = true;
                     count = c;
@@ -540,7 +530,7 @@ mod tests {
         let (hits, done, _) = collect(&s);
         assert!(done);
         assert_eq!(
-            hits.iter().map(|x| x.0).collect::<Vec<_>>(),
+            hits,
             vec![1, 2],
             "hits={hits:?}"
         );
@@ -554,9 +544,7 @@ mod tests {
         .unwrap();
         let (hits, done, _) = collect(&s);
         assert!(done);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0, 2);
-        assert_eq!(hits[0].1, "第二行 hello", "hits={hits:?}");
+        assert_eq!(hits, vec![2], "hits={hits:?}");
         std::fs::remove_file(&p).ok();
     }
 
@@ -575,10 +563,7 @@ mod tests {
         let (hits, done, count) = collect(&s);
         assert!(done);
         assert_eq!(count, 2, "hits={hits:?}");
-        assert_eq!(hits.len(), 2, "hits={hits:?}");
-        assert_eq!(hits[0].0, 2, "hits={hits:?}");
-        assert_eq!(hits[0].1, "hello world", "hits={hits:?}");
-        assert_eq!(hits[1].0, 3, "hits={hits:?}");
+        assert_eq!(hits, vec![2, 3], "hits={hits:?}");
 
         // 忽略大小写 / LOG 命中第 4 行
         let s = RgSearch::start(
@@ -591,7 +576,7 @@ mod tests {
         .unwrap();
         let (hits, done, _) = collect(&s);
         assert!(done);
-        assert!(hits.iter().any(|(n, t)| *n == 4 && t == "LOG it"));
+        assert!(hits.contains(&4));
 
         // 整词 log：应命中行 4（LOG）而不再命中行 2/3 的 hello（无独立 log 词？有）验证 -w 生效
         let s = RgSearch::start(
@@ -604,7 +589,7 @@ mod tests {
         .unwrap();
         let (hits, done, _) = collect(&s);
         assert!(done);
-        assert_eq!(hits.iter().map(|x| x.0).collect::<Vec<_>>(), vec![4]);
+        assert_eq!(hits, vec![4]);
 
         std::fs::remove_file(&p).ok();
     }
