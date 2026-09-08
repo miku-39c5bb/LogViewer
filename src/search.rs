@@ -311,13 +311,10 @@ impl TranscodingReader {
             }
             return;
         }
-        // encoding_rs 路径：以 last=true 收尾处理截断半字符
-        let mut buf = [0u8; 256];
-        loop {
-            let (_, _, u, _) = self.dec.decode_to_utf8(&[], &mut buf, true);
-            if u == 0 {
-                break;
-            }
+        // encoding_rs 路径：以 last=true 收尾一次（此后解码器 finished，不可再调用）
+        let mut buf = [0u8; 32];
+        let (_, _, u, _) = self.dec.decode_to_utf8(&[], &mut buf, true);
+        if u > 0 {
             self.pending.extend_from_slice(&buf[..u]);
         }
     }
