@@ -184,6 +184,31 @@ impl RgSearch {
 }
 
 
+/// GB18030/GBK 双字节 → Unicode（65536 表，构建自 encoding_rs，启动时一次性）。
+static GBK_TABLE: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+fn gbk_table() -> &'static [u32] {
+    GBK_TABLE.get_or_init(|| {
+        let mut t = vec![0xFFFFu32; 65536]; // 0xFFFF = 无效
+        for lead in 0x81u32..=0xFE {
+            for trail in 0x40u32..=0xFE {
+                if trail == 0x7F {
+                    continue;
+                }
+                let bytes = [lead as u8, trail as u8];
+                let (c, _, _) = encoding_rs::GB18030.decode(&bytes);
+                let cp = if c.chars().count() == 1 {
+                    c.chars().next().unwrap() as u32
+                } else {
+                    0xFFFD
+                };
+                t[(lead as usize) << 8 | trail as usize] = cp;
+            }
+        }
+        t
+    })
+}
+
 /// 流式转码 Reader：把非 UTF-8 文件字节流增量解码为 UTF-8 流（保行结构），喂给引擎。
 struct TranscodingReader {
     file: std::fs::File,
@@ -192,10 +217,15 @@ struct TranscodingReader {
     pending: Vec<u8>,
     pend_pos: usize,
     finished: bool,
+    /// GB18030/GBK 走查表直转（fast）；其它（UTF-16）走 encoding_rs
+    fast: bool,
+    /// 跨块滞留的 lead 字节
+    carry: Option<u8>,
 }
 
 impl TranscodingReader {
     fn new(file: std::fs::File, enc: &'static encoding_rs::Encoding) -> Self {
+        let fast = enc == encoding_rs::GB18030 || enc == encoding_rs::GBK;
         TranscodingReader {
             file,
             dec: enc.new_decoder(),
@@ -203,6 +233,70 @@ impl TranscodingReader {
             pending: Vec::new(),
             pend_pos: 0,
             finished: false,
+            fast,
+            carry: None,
+        }
+    }
+
+    fn push_cp(&mut self, cp: u32) {
+        if cp == 0xFFFF {
+            self.pending.push(b'?');
+            return;
+        }
+        if cp < 0x80 {
+            self.pending.push(cp as u8);
+        } else if cp < 0x800 {
+            self.pending.push(0xC0 | (cp >> 6) as u8);
+            self.pending.push(0x80 | (cp & 0x3F) as u8);
+        } else {
+            self.pending.push(0xE0 | (cp >> 12) as u8);
+            self.pending.push(0x80 | ((cp >> 6) & 0x3F) as u8);
+            self.pending.push(0x80 | (cp & 0x3F) as u8);
+        }
+    }
+
+    fn pair_cp(&self, lead: u8, trail: u8, tbl: &[u32]) -> u32 {
+        if (0x40..=0xFE).contains(&trail) && trail != 0x7F {
+            tbl[(lead as usize) << 8 | trail as usize]
+        } else if (0x30..=0x39).contains(&trail) {
+            0xFFFD // GB18030 4 字节补充区首字节组：常用字不在此，替换占位
+        } else {
+            0xFFFD
+        }
+    }
+
+    /// GB18030/GBK 查表直转一块输入（ASCII 直通；跨块 lead 保留到 carry）。
+    fn append_fast(&mut self, src: &[u8]) {
+        let tbl = gbk_table();
+        let mut i = 0usize;
+        while i < src.len() {
+            let b = src[i];
+            if b < 0x80 {
+                self.pending.push(b);
+                i += 1;
+                continue;
+            }
+            if let Some(lead) = self.carry.take() {
+                let cp = self.pair_cp(lead, b, tbl);
+                self.push_cp(cp);
+                i += 1;
+                continue;
+            }
+            if (0x81..=0xFE).contains(&b) {
+                if i + 1 < src.len() {
+                    let t = src[i + 1];
+                    let cp = self.pair_cp(b, t, tbl);
+                    self.push_cp(cp);
+                    i += 2;
+                } else {
+                    self.carry = Some(b);
+                    i += 1;
+                    break;
+                }
+                continue;
+            }
+            self.push_cp(0xFFFD); // 其它 >=0x80 的孤立字节
+            i += 1;
         }
     }
 
@@ -211,7 +305,13 @@ impl TranscodingReader {
             return;
         }
         self.finished = true;
-        // 以 last=true 通知解码器输入流结束，处理截断在尾部的半字符
+        if self.fast {
+            if let Some(_lead) = self.carry.take() {
+                self.push_cp(0xFFFD); // 文件尾孤立的 lead
+            }
+            return;
+        }
+        // encoding_rs 路径：以 last=true 收尾处理截断半字符
         let mut buf = [0u8; 256];
         loop {
             let (_, _, u, _) = self.dec.decode_to_utf8(&[], &mut buf, true);
@@ -243,7 +343,12 @@ impl std::io::Read for TranscodingReader {
                 self.drain_tail();
                 continue;
             }
-            // 增量解码整块输入（GB18030/GBK 到 UTF-8 放大倍数 < 4，一次 scratch 足够）
+            if self.fast {
+                let chunk = self.src_buf[..n].to_vec();
+                self.append_fast(&chunk);
+                continue;
+            }
+            // encoding_rs 路径：增量解码整块输入（UTF-16 等）
             let mut scratch = vec![0u8; self.src_buf.len() * 4 + 64];
             let mut consumed = 0usize;
             while consumed < n {
