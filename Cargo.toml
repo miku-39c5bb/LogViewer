@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+arboard = "3.6.1"
 crossterm = "0.29.0"
 dirs = "7.0.0"
 encoding_rs = "0.8.35"

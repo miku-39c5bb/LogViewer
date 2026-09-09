@@ -99,6 +99,26 @@ pub enum Mode {
     History(HistoryState),
     /// 帮助面板（F1）
     Help,
+    /// 视觉选择（v / V / Ctrl-V；y 复制，Esc 退出）
+    Visual(VisualState),
+}
+
+/// 视觉选择状态（作用于主文件窗）。
+pub struct VisualState {
+    kind: VisualKind,
+    /// 起始行（1-based）
+    anchor_row: u64,
+    /// 起始列（字符下标，含）
+    anchor_col: usize,
+    /// 当前列（字符下标，含）
+    cur_col: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VisualKind {
+    Char,
+    Line,
+    Block,
 }
 
 /// 目标选择模式下待放置的匹配上下文。
@@ -136,6 +156,9 @@ impl Mode {
     }
     fn is_help(&self) -> bool {
         matches!(self, Mode::Help)
+    }
+    fn is_visual(&self) -> bool {
+        matches!(self, Mode::Visual(_))
     }
 }
 
@@ -908,6 +931,179 @@ impl App {
     }
 }
 
+/// 按字符下标截取字符串 [from,to_excl)（下标越界 → 截到字符串末尾）。
+fn slice_chars(s: &str, from: usize, to_excl: usize) -> String {
+    let mut start = s.len();
+    let mut end = s.len();
+    let mut i = 0usize;
+    for (bi, ch) in s.char_indices() {
+        if i == from {
+            start = bi;
+        }
+        if i == to_excl {
+            end = bi;
+            break;
+        }
+        i += 1;
+    }
+    if to_excl > 0 && i <= to_excl && to_excl >= from && end == s.len() {
+        end = s.len();
+    }
+    if from > i {
+        return String::new();
+    }
+    s[start..end.min(s.len())].to_string()
+}
+
+impl App {
+    fn start_visual(&mut self, kind: crate::app::VisualKind) {
+        if self.focus != 0 {
+            self.set_msg("视觉选择仅支持主文件窗");
+            return;
+        }
+        let row = {
+            let Content::File(fc) = &self.panes[0].content else {
+                return;
+            };
+            fc.view.cursor_line1()
+        };
+        // 进入后关闭自动换行与水平滚动，保证“行=整行文本”语义清晰
+        if let Content::File(fc) = &mut self.panes[0].content {
+            fc.wrap = false;
+            fc.hscroll = 0;
+        }
+        self.mode = Mode::Visual(VisualState {
+            kind,
+            anchor_row: row,
+            anchor_col: 0,
+            cur_col: 0,
+        });
+    }
+
+    /// 当前光标行文本的字符数（用于列移动 clamp）
+    fn visual_cur_len(&mut self) -> usize {
+        let row = {
+            let Content::File(fc) = &self.panes[0].content else {
+                return 0;
+            };
+            fc.view.cursor_line1()
+        };
+        self.main_read_line(row).map(|t| t.chars().count()).unwrap_or(0)
+    }
+
+    fn visual_move_row(&mut self, dir: i64) {
+        if let Content::File(fc) = &mut self.panes[0].content {
+            fc.view.move_cursor(dir);
+        }
+        let len = self.visual_cur_len();
+        if let Mode::Visual(v) = &mut self.mode {
+            v.cur_col = v.cur_col.min(len);
+        }
+    }
+
+    fn visual_move_col(&mut self, delta: i64) {
+        let len = self.visual_cur_len();
+        if let Mode::Visual(v) = &mut self.mode {
+            let c = v.cur_col as i64 + delta;
+            v.cur_col = c.clamp(0, len as i64) as usize;
+        }
+    }
+
+    /// 选区覆盖的行范围（含端点，1-based）
+    fn visual_row_span(&self) -> Option<(u64, u64)> {
+        let Mode::Visual(v) = &self.mode else {
+            return None;
+        };
+        let cur = {
+            let Content::File(fc) = &self.panes[0].content else {
+                return None;
+            };
+            fc.view.cursor_line1()
+        };
+        Some((v.anchor_row.min(cur), v.anchor_row.max(cur)))
+    }
+
+    fn on_visual_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Char('y') => self.visual_yank(),
+            KeyCode::Left | KeyCode::Char('h') => self.visual_move_col(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.visual_move_col(1),
+            KeyCode::Up | KeyCode::Char('k') => self.visual_move_row(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.visual_move_row(1),
+            _ => {}
+        }
+    }
+
+    /// 复制选区到系统剪贴板并退出视觉模式。
+    fn visual_yank(&mut self) {
+        let (kind, a_row, a_col, b_col) = match &self.mode {
+            Mode::Visual(v) => (v.kind, v.anchor_row, v.anchor_col, v.cur_col),
+            _ => return,
+        };
+        let cur_row = {
+            let Content::File(fc) = &self.panes[0].content else {
+                return;
+            };
+            fc.view.cursor_line1()
+        };
+        let r1 = a_row.min(cur_row);
+        let r2 = a_row.max(cur_row);
+        let mut lines: Vec<String> = Vec::new();
+        for r in r1..=r2 {
+            lines.push(self.main_read_line(r).unwrap_or_default());
+        }
+        let out: String = match kind {
+            crate::app::VisualKind::Line => {
+                let mut s = lines.join("\n");
+                s.push('\n');
+                s
+            }
+            crate::app::VisualKind::Block => {
+                let (c1, c2) = (a_col.min(b_col), a_col.max(b_col));
+                lines
+                    .iter()
+                    .map(|l| slice_chars(l, c1, c2 + 1))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            crate::app::VisualKind::Char => {
+                let (c1, c2) = (a_col.min(b_col), a_col.max(b_col));
+                if r1 == r2 {
+                    slice_chars(&lines[0], c1, c2 + 1)
+                } else {
+                    let mut s = slice_chars(&lines[0], c1, usize::MAX);
+                    for l in &lines[1..lines.len() - 1] {
+                        s.push('\n');
+                        s.push_str(l);
+                    }
+                    s.push('\n');
+                    s.push_str(&slice_chars(
+                        lines.last().unwrap_or(&String::new()),
+                        0,
+                        c2 + 1,
+                    ));
+                    s
+                }
+            }
+        };
+        let copied = match arboard::Clipboard::new() {
+            Ok(mut cb) => cb.set_text(out.clone()).is_ok(),
+            Err(_) => false,
+        };
+        self.mode = Mode::Normal;
+        if copied {
+            self.set_msg(format!(
+                "已复制 {} 行 / {} 字符到系统剪贴板",
+                r2 - r1 + 1,
+                out.chars().count()
+            ));
+        } else {
+            self.set_msg("复制到系统剪贴板失败");
+        }
+    }
+}
+
 // ---------- 按键分发 ----------
 
 impl App {
@@ -924,6 +1120,8 @@ impl App {
             self.on_history_key(key);
         } else if self.mode.is_help() {
             self.on_help_key(key);
+        } else if self.mode.is_visual() {
+            self.on_visual_key(key);
         } else {
             self.on_normal_key(key);
         }
@@ -974,6 +1172,25 @@ impl App {
         if key.code == KeyCode::Esc {
             self.cancel_jump("cancelled: jump");
             return;
+        }
+        // 视觉选择进入（仅主文件窗）
+        if self.focus == 0 {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Char('v') if ctrl => {
+                    self.start_visual(crate::app::VisualKind::Block);
+                    return;
+                }
+                KeyCode::Char('V') => {
+                    self.start_visual(crate::app::VisualKind::Line);
+                    return;
+                }
+                KeyCode::Char('v') => {
+                    self.start_visual(crate::app::VisualKind::Char);
+                    return;
+                }
+                _ => {}
+            }
         }
         // 数字键 1-9：直接把焦点切到对应编号窗格（编号 = 几何顺序，动态不进入配置表）
         if let KeyCode::Char(d) = key.code {
@@ -2348,10 +2565,12 @@ impl App {
         hl: Option<&Regex>,
         theme: &crate::theme::Theme,
         kw: Color,
+        sel_row: bool,
+        cursor_marker: bool,
     ) {
-        let marker = |c: bool| -> Span<'static> {
+        let marker = || -> Span<'static> {
             Span::styled(
-                if c { "▶" } else { " " },
+                if cursor_marker { "▶" } else { " " },
                 Style::new().fg(theme.cursor_marker).add_modifier(Modifier::BOLD),
             )
         };
@@ -2396,7 +2615,7 @@ impl App {
             for (k, seg) in segs.into_iter().enumerate() {
                 let mut spans = Vec::new();
                 if k == 0 {
-                    spans.push(marker(cur));
+                    spans.push(marker());
                     spans.push(no_span());
                 } else {
                     // 续行：↪ 顶最左 + 空行号区 + │ 延续竖线，文本与首行内容左对齐
@@ -2414,13 +2633,13 @@ impl App {
                             .add_modifier(Modifier::DIM),
                     ));
                 }
-                append_highlighted(&mut spans, seg, hl, cur, theme, kw);
+                append_highlighted(&mut spans, seg, hl, cur, sel_row, theme, kw);
                 out.push(Line::from(spans));
             }
         } else {
             let seg = slice_cols(text, hscroll, budget_first);
-            let mut spans = vec![marker(cur), no_span()];
-            append_highlighted(&mut spans, seg, hl, cur, theme, kw);
+            let mut spans = vec![marker(), no_span()];
+            append_highlighted(&mut spans, seg, hl, cur, sel_row, theme, kw);
             out.push(Line::from(spans));
         }
     }
@@ -2431,18 +2650,128 @@ impl App {
         let cursor_line1 = fc.view.cursor_line1();
         // 行内匹配高亮色由 [theme].keyword 配置
         let kw = self.theme.keyword;
+        // 视觉选择选区（整行高亮）
+        let sel_span = self.visual_row_span();
         let ln_w = top.saturating_add(rows.len() as u64).to_string().len().max(4);
         let cols = cols as usize;
         let budget1 = cols.saturating_sub(1 + ln_w + 1).max(4);
         let mut lines = Vec::new();
         for (i, row) in rows.iter().enumerate() {
             let line1 = top + i as u64;
-            let cur = cursor_line1 == line1;
+            let is_cursor = cursor_line1 == line1;
+            // 视觉选择模式：列级选中高亮（光标行无整行底色，选中字符段灰底）
+            if let Mode::Visual(v) = &self.mode {
+                let text = row.text.as_str();
+                let nchars = text.chars().count();
+                // 本行选中的字符区间 [lo, hi)（含端点换算为 hi = last+1）
+                let r1 = v.anchor_row.min(cursor_line1);
+                let r2 = v.anchor_row.max(cursor_line1);
+                let lo_hi = if line1 < r1 || line1 > r2 {
+                    None
+                } else if v.kind == crate::app::VisualKind::Line {
+                    Some((0usize, nchars))
+                } else if v.kind == crate::app::VisualKind::Block {
+                    let (c1, c2) = (v.anchor_col.min(v.cur_col), v.anchor_col.max(v.cur_col));
+                    Some((c1.min(nchars), (c2 + 1).min(nchars)))
+                } else {
+                    // Char 模式：单行取两端列；多行首/末行取各自端点列，中间行全行
+                    if r1 == r2 {
+                        let (c1, c2) = (v.anchor_col.min(v.cur_col), v.anchor_col.max(v.cur_col));
+                        Some((c1.min(nchars), (c2 + 1).min(nchars)))
+                    } else if line1 == r1 {
+                        let edge = if v.anchor_row == r1 {
+                            v.anchor_col
+                        } else {
+                            v.cur_col
+                        };
+                        Some((edge.min(nchars), nchars))
+                    } else if line1 == r2 {
+                        let edge = if v.anchor_row == r2 {
+                            v.anchor_col
+                        } else {
+                            v.cur_col
+                        };
+                        Some((0, (edge + 1).min(nchars)))
+                    } else {
+                        Some((0, nchars))
+                    }
+                };
+                let (lo, hi) = match lo_hi {
+                    Some((a, b)) => (a, b),
+                    None => (0, 0),
+                };
+                let empty_sel = match lo_hi {
+                    Some((a, b)) => a >= b,
+                    None => true,
+                };
+                // 光标字符列（蓝格）；光标在行尾后时用尾部空格块
+                let cur_cell = if is_cursor { Some(v.cur_col) } else { None };
+                // 组装本行 spans
+                let mut spans = vec![Span::styled(
+                    if is_cursor { "▶" } else { " " },
+                    Style::new()
+                        .fg(self.theme.cursor_marker)
+                        .add_modifier(Modifier::BOLD),
+                )];
+                spans.push(Span::styled(
+                    format!("{line1:>ln_w$}│"),
+                    Style::new()
+                        .fg(self.theme.line_number)
+                        .add_modifier(Modifier::DIM),
+                ));
+                let mut pos = 0usize;
+                let cur_b = cur_cell
+                    .map(|c| text.char_indices().nth(c).map(|x| x.0).unwrap_or(text.len()));
+                let lo_b = text.char_indices().nth(lo).map(|x| x.0).unwrap_or(text.len());
+                let hi_b = text
+                    .char_indices()
+                    .nth(hi)
+                    .map(|x| x.0)
+                    .unwrap_or(text.len());
+                // 前段：光标字符前、未选区域
+                while pos < text.len() {
+                    let next_b = pos + text[pos..].chars().next().unwrap().len_utf8();
+                    let in_sel = !empty_sel && pos >= lo_b && pos < hi_b;
+                    let is_cur = cur_b == Some(pos);
+                    if is_cur {
+                        spans.push(Span::styled(
+                            text[pos..next_b].to_string(),
+                            Style::new()
+                                .bg(self.theme.cursor_line_bg)
+                                .fg(self.theme.cursor_line_text),
+                        ));
+                    } else if in_sel {
+                        spans.push(Span::styled(
+                            text[pos..next_b].to_string(),
+                            Style::new().bg(Color::DarkGray).fg(Color::White),
+                        ));
+                    } else {
+                        spans.push(Span::styled(
+                            text[pos..next_b].to_string(),
+                            Style::new().fg(self.theme.text),
+                        ));
+                    }
+                    pos = next_b;
+                }
+                // 光标位于行尾后：追加一个空格光标块
+                if is_cursor && cur_cell.unwrap_or(0) >= nchars {
+                    spans.push(Span::styled(
+                        " ",
+                        Style::new()
+                            .bg(self.theme.cursor_line_bg)
+                            .fg(self.theme.cursor_line_text),
+                    ));
+                }
+                lines.push(Line::from(spans));
+                continue;
+            }
+            // 普通模式：整行光标蓝底 + 关键字高亮
+            let cur_arg = is_cursor;
             Self::push_row_lines(
                 &mut lines,
                 line1.to_string(),
                 ln_w,
-                cur,
+                cur_arg,
                 &row.text,
                 fc.hscroll,
                 fc.wrap,
@@ -2450,6 +2779,8 @@ impl App {
                 fc.hl.as_ref(),
                 &self.theme,
                 kw,
+                false,
+                is_cursor,
             );
         }
         lines
@@ -2500,6 +2831,8 @@ impl App {
                 hl_re.as_ref(),
                 theme,
                 kw,
+                false,
+                cur,
             );
         }
         lines
@@ -2828,21 +3161,30 @@ fn fuzzy_subseq(query: &str, text: &str) -> bool {
 }
 
 /// 将一行文本按高亮正则拆成带色 span。
-/// 行底色仅用于光标/选中行；kw 为关键字高亮色（与提示符色一致时可传 prompt 色）。
+/// 行底色：光标行 → 主题光标行底色；选区行(sel_row) → 灰色底；均无 → 无底色。
 fn append_highlighted(
     spans: &mut Vec<Span>,
     text: &str,
     hl: Option<&Regex>,
     cur: bool,
+    sel_row: bool,
     theme: &crate::theme::Theme,
     kw: Color,
 ) {
     let base = if cur {
         theme.cursor_line_text
+    } else if sel_row {
+        Color::White
     } else {
         theme.text
     };
-    let bg = if cur { Some(theme.cursor_line_bg) } else { None };
+    let bg = if cur {
+        Some(theme.cursor_line_bg)
+    } else if sel_row {
+        Some(Color::DarkGray)
+    } else {
+        None
+    };
     let mk = |s: String, fg: Color, bold: bool| -> Span {
         let mut st = Style::new().fg(fg);
         if let Some(b) = bg {
