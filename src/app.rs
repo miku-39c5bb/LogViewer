@@ -85,6 +85,52 @@ fn wrap_cols(s: &str, max: usize) -> Vec<String> {
     out
 }
 
+/// 从行首到第 char_idx 个字符起点处的累计显示列宽（char_idx 为字符下标，可等于行字符数=行尾列）。
+fn char_to_col(text: &str, char_idx: usize) -> usize {
+    let mut col = 0usize;
+    for (i, ch) in text.chars().enumerate() {
+        if i >= char_idx {
+            break;
+        }
+        col += ch.width().unwrap_or(1);
+    }
+    col
+}
+
+/// 把显示列 col 换算为「该列落在其中的字符」的下标；col 落在宽字符内部时取该宽字符起点。
+fn col_to_char(text: &str, col: usize) -> usize {
+    let mut acc = 0usize; // 累计到下一字符起点前的列
+    let mut ci = 0usize;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(1);
+        if col <= acc + w - 1 {
+            return ci;
+        }
+        acc += w;
+        ci += 1;
+    }
+    ci
+}
+
+/// 把光标显示列 col 框进水平窗口 [hscroll, hscroll+budget)：
+/// 文本宽度不足时归零；光标越左/越右时平移窗口；返回新的 hscroll。
+/// 右界多放宽 1 列：行尾后没有字符的“尾部光标格”也需要能显示。
+fn ensure_hs(hs: usize, col: usize, budget: usize, text_width: usize) -> usize {
+    if text_width <= budget || budget == 0 {
+        return 0;
+    }
+    let max_hs = text_width.saturating_sub(budget).saturating_add(1);
+    let col = col.min(text_width);
+    let mut h = hs.min(max_hs);
+    if col < h {
+        h = col;
+    }
+    if col >= h + budget {
+        h = col.saturating_sub(budget - 1).min(max_hs);
+    }
+    h
+}
+
 // ---------- 模式与命令输入 ----------
 
 pub enum Mode {
@@ -119,6 +165,67 @@ pub enum VisualKind {
     Char,
     Line,
     Block,
+}
+
+/// 非软换行行渲染（水平窗口）的逐字符样式来源。
+pub(crate) enum WinRowStyle<'a> {
+    /// 普通模式：关键字高亮 + 列光标格（None=该行非光标行）
+    Normal {
+        marker: bool,
+        hl: Option<&'a Regex>,
+        cursor_col: Option<usize>,
+    },
+    /// 视觉模式：字符选区 + 光标格
+    Visual {
+        marker: bool,
+        lo: usize,
+        hi: usize,
+        empty: bool,
+        cur_char: Option<usize>,
+    },
+}
+
+/// 视觉模式下本行（line1）应高亮的字符区间 [lo, hi) 及是否空选。
+/// 非选区行返回空区间 (0,0,true)。
+fn visual_range(
+    v: &VisualState,
+    line1: u64,
+    cursor_line1: u64,
+    nchars: usize,
+) -> (usize, usize, bool) {
+    let r1 = v.anchor_row.min(cursor_line1);
+    let r2 = v.anchor_row.max(cursor_line1);
+    let lo_hi = if line1 < r1 || line1 > r2 {
+        None
+    } else if v.kind == VisualKind::Line {
+        Some((0usize, nchars))
+    } else if v.kind == VisualKind::Block {
+        let (c1, c2) = (v.anchor_col.min(v.cur_col), v.anchor_col.max(v.cur_col));
+        Some((c1.min(nchars), (c2 + 1).min(nchars)))
+    } else if r1 == r2 {
+        let (c1, c2) = (v.anchor_col.min(v.cur_col), v.anchor_col.max(v.cur_col));
+        Some((c1.min(nchars), (c2 + 1).min(nchars)))
+    } else if line1 == r1 {
+        let edge = if v.anchor_row == r1 {
+            v.anchor_col
+        } else {
+            v.cur_col
+        };
+        Some((edge.min(nchars), nchars))
+    } else if line1 == r2 {
+        let edge = if v.anchor_row == r2 {
+            v.anchor_col
+        } else {
+            v.cur_col
+        };
+        Some((0, (edge + 1).min(nchars)))
+    } else {
+        Some((0, nchars))
+    };
+    match lo_hi {
+        Some((a, b)) => (a, b, a >= b),
+        None => (0, 0, true),
+    }
 }
 
 /// 目标选择模式下待放置的匹配上下文。
@@ -203,6 +310,8 @@ pub struct FileContent {
     inner_h: usize,
     /// 水平滚动列数
     hscroll: usize,
+    /// 光标所在显示列（wrap 关闭时的列光标；wrap 开启不使用）
+    cur_col: usize,
     /// 自动换行显示（软 wrap）
     wrap: bool,
 }
@@ -255,6 +364,7 @@ impl Pane {
                 hl: None,
                 inner_h: 24,
                 hscroll: 0,
+                cur_col: 0,
                 wrap: false,
             }),
         })
@@ -936,7 +1046,7 @@ fn slice_chars(s: &str, from: usize, to_excl: usize) -> String {
     let mut start = s.len();
     let mut end = s.len();
     let mut i = 0usize;
-    for (bi, ch) in s.char_indices() {
+    for (bi, _) in s.char_indices() {
         if i == from {
             start = bi;
         }
@@ -961,21 +1071,22 @@ impl App {
             self.set_msg("视觉选择仅支持主文件窗");
             return;
         }
-        let row = {
+        let (row, cur_col) = {
             let Content::File(fc) = &self.panes[0].content else {
                 return;
             };
-            fc.view.cursor_line1()
+            (fc.view.cursor_line1(), fc.cur_col)
         };
-        // 水平滚动归零，保证字符级渲染从行首可见；自动换行保持用户当前设置不变
-        if let Content::File(fc) = &mut self.panes[0].content {
-            fc.hscroll = 0;
-        }
+        // 视觉从列光标处开始（wrap 开/关均适用）
+        let start_char = match self.main_read_line(row) {
+            Some(t) => col_to_char(&t, cur_col),
+            None => 0,
+        };
         self.mode = Mode::Visual(VisualState {
             kind,
             anchor_row: row,
-            anchor_col: 0,
-            cur_col: 0,
+            anchor_col: start_char,
+            cur_col: start_char,
         });
     }
 
@@ -1002,13 +1113,42 @@ impl App {
 
     fn visual_move_col(&mut self, delta: i64) {
         let len = self.visual_cur_len();
-        if let Mode::Visual(v) = &mut self.mode {
-            let c = v.cur_col as i64 + delta;
-            v.cur_col = c.clamp(0, len as i64) as usize;
+        let cur = {
+            if let Mode::Visual(v) = &mut self.mode {
+                let c = v.cur_col as i64 + delta;
+                v.cur_col = c.clamp(0, len as i64) as usize;
+                v.cur_col
+            } else {
+                return;
+            }
+        };
+        // wrap 关闭：水平窗口跟随视觉光标列，保证光标字符可见
+        if self.focus == 0 && self.main_file_nowrap() {
+            let lc = self.last_cols;
+            let Content::File(fc) = &mut self.panes[0].content else {
+                return;
+            };
+            let row = fc.view.cursor_line1();
+            let Some(t) = fc.view.read_line_text(row) else {
+                return;
+            };
+            let n = t.chars().count();
+            let col = char_to_col(&t, cur.min(n));
+            let tw = UnicodeWidthStr::width(t.as_str());
+            let ln_w = fc
+                .view
+                .top_line1()
+                .saturating_add(fc.inner_h as u64)
+                .to_string()
+                .len()
+                .max(4);
+            let budget = lc.saturating_sub(1 + ln_w + 1).max(4);
+            fc.hscroll = ensure_hs(fc.hscroll, col, budget, tw);
         }
     }
 
     /// 选区覆盖的行范围（含端点，1-based）
+    #[allow(dead_code)]
     fn visual_row_span(&self) -> Option<(u64, u64)> {
         let Mode::Visual(v) = &self.mode else {
             return None;
@@ -1268,10 +1408,34 @@ impl App {
             A::Zoom => self.zoom_toggle(),
             A::Export => self.export_focus(),
             A::Follow => self.toggle_follow(),
-            A::HLeft => self.pane_hscroll(-8),
-            A::HRight => self.pane_hscroll(8),
-            A::HHome => self.pane_hscroll(0),
-            A::HEnd => self.pane_goto_eol(),
+            A::HLeft => {
+                if self.is_main_file() {
+                    self.file_col_move(-1);
+                } else {
+                    self.pane_hscroll(-8);
+                }
+            }
+            A::HRight => {
+                if self.is_main_file() {
+                    self.file_col_move(1);
+                } else {
+                    self.pane_hscroll(8);
+                }
+            }
+            A::HHome => {
+                if self.is_main_file() {
+                    self.file_col_home();
+                } else {
+                    self.pane_hscroll(0);
+                }
+            }
+            A::HEnd => {
+                if self.is_main_file() {
+                    self.file_col_end();
+                } else {
+                    self.pane_goto_eol();
+                }
+            }
             A::Wrap => self.pane_toggle_wrap(),
             A::ClosePane => self.close_focus_pane(),
             A::EnterJump => {
@@ -1318,6 +1482,105 @@ impl App {
         }
         fc.hl = None;
         self.msg.clear();
+    }
+
+    /// 焦点是否为文件窗（wrap 开启时 h/l 同为列光标；仅横向窗口滚动语义不同）。
+    fn is_main_file(&self) -> bool {
+        if self.focus != 0 {
+            return false;
+        }
+        matches!(&self.panes[0].content, Content::File(_))
+    }
+
+    /// 焦点是否为文件窗且关闭自动换行（此时 h/l 是列光标语义，含水平滚动）。
+    fn main_file_nowrap(&self) -> bool {
+        if self.focus != 0 {
+            return false;
+        }
+        matches!(
+            &self.panes[0].content,
+            Content::File(fc) if !fc.wrap
+        )
+    }
+
+    /// 文件窗列光标水平移动（h=左 l=右，钳制在当前行内；wrap 关闭时窗口跟随）。
+    fn file_col_move(&mut self, delta: i64) {
+        if !self.is_main_file() {
+            return;
+        }
+        let lc = self.last_cols;
+        let Content::File(fc) = &mut self.panes[0].content else {
+            return;
+        };
+        let wrap = fc.wrap;
+        let row = fc.view.cursor_line1();
+        let Some(t) = fc.view.read_line_text(row) else {
+            return;
+        };
+        let tw = UnicodeWidthStr::width(t.as_str());
+        let n = t.chars().count();
+        // 按字符步进（宽字符一次跳过），当前列吸附到所在字符起点
+        let ci_now = col_to_char(&t, fc.cur_col.min(tw));
+        let ci_new = if delta > 0 {
+            if ci_now >= n {
+                n
+            } else {
+                ci_now + 1
+            }
+        } else {
+            ci_now.saturating_sub(1)
+        };
+        fc.cur_col = char_to_col(&t, ci_new);
+        if !wrap {
+            let ln_w = fc
+                .view
+                .top_line1()
+                .saturating_add(fc.inner_h as u64)
+                .to_string()
+                .len()
+                .max(4);
+            let budget = lc.saturating_sub(1 + ln_w + 1).max(4);
+            fc.hscroll = ensure_hs(fc.hscroll, fc.cur_col, budget, tw);
+        }
+    }
+
+    fn file_col_home(&mut self) {
+        if !self.is_main_file() {
+            return;
+        }
+        let Content::File(fc) = &mut self.panes[0].content else {
+            return;
+        };
+        fc.cur_col = 0;
+        fc.hscroll = 0;
+    }
+
+    fn file_col_end(&mut self) {
+        if !self.is_main_file() {
+            return;
+        }
+        let lc = self.last_cols;
+        let Content::File(fc) = &mut self.panes[0].content else {
+            return;
+        };
+        let wrap = fc.wrap;
+        let row = fc.view.cursor_line1();
+        let Some(t) = fc.view.read_line_text(row) else {
+            return;
+        };
+        let tw = UnicodeWidthStr::width(t.as_str());
+        fc.cur_col = tw;
+        if !wrap {
+            let ln_w = fc
+                .view
+                .top_line1()
+                .saturating_add(fc.inner_h as u64)
+                .to_string()
+                .len()
+                .max(4);
+            let budget = lc.saturating_sub(1 + ln_w + 1).max(4);
+            fc.hscroll = ensure_hs(fc.hscroll, tw, budget, tw);
+        }
     }
 
     /// 焦点窗格的按行移动（文件窗=光标移动；匹配窗=移动选中行）
@@ -2649,8 +2912,6 @@ impl App {
         let cursor_line1 = fc.view.cursor_line1();
         // 行内匹配高亮色由 [theme].keyword 配置
         let kw = self.theme.keyword;
-        // 视觉选择选区（整行高亮）
-        let sel_span = self.visual_row_span();
         let ln_w = top.saturating_add(rows.len() as u64).to_string().len().max(4);
         let cols = cols as usize;
         let budget1 = cols.saturating_sub(1 + ln_w + 1).max(4);
@@ -2658,145 +2919,486 @@ impl App {
         for (i, row) in rows.iter().enumerate() {
             let line1 = top + i as u64;
             let is_cursor = cursor_line1 == line1;
-            // 视觉选择模式：列级选中高亮（光标行无整行底色，选中字符段灰底）
-            if let Mode::Visual(v) = &self.mode {
-                let text = row.text.as_str();
-                let nchars = text.chars().count();
-                // 本行选中的字符区间 [lo, hi)（含端点换算为 hi = last+1）
-                let r1 = v.anchor_row.min(cursor_line1);
-                let r2 = v.anchor_row.max(cursor_line1);
-                let lo_hi = if line1 < r1 || line1 > r2 {
-                    None
-                } else if v.kind == crate::app::VisualKind::Line {
-                    Some((0usize, nchars))
-                } else if v.kind == crate::app::VisualKind::Block {
-                    let (c1, c2) = (v.anchor_col.min(v.cur_col), v.anchor_col.max(v.cur_col));
-                    Some((c1.min(nchars), (c2 + 1).min(nchars)))
-                } else {
-                    // Char 模式：单行取两端列；多行首/末行取各自端点列，中间行全行
-                    if r1 == r2 {
-                        let (c1, c2) = (v.anchor_col.min(v.cur_col), v.anchor_col.max(v.cur_col));
-                        Some((c1.min(nchars), (c2 + 1).min(nchars)))
-                    } else if line1 == r1 {
-                        let edge = if v.anchor_row == r1 {
-                            v.anchor_col
-                        } else {
-                            v.cur_col
-                        };
-                        Some((edge.min(nchars), nchars))
-                    } else if line1 == r2 {
-                        let edge = if v.anchor_row == r2 {
-                            v.anchor_col
-                        } else {
-                            v.cur_col
-                        };
-                        Some((0, (edge + 1).min(nchars)))
-                    } else {
-                        Some((0, nchars))
-                    }
-                };
-                let (lo, hi) = match lo_hi {
-                    Some((a, b)) => (a, b),
-                    None => (0, 0),
-                };
-                let empty_sel = match lo_hi {
-                    Some((a, b)) => a >= b,
-                    None => true,
-                };
-                // 光标字符列（蓝格）；光标在行尾后时用尾部空格块
-                let cur_cell = if is_cursor { Some(v.cur_col) } else { None };
-                let dim_ln = || -> Span<'static> {
-                    Span::styled(
-                        "│",
-                        Style::new()
-                            .fg(self.theme.line_number)
-                            .add_modifier(Modifier::DIM),
+            let text = row.text.as_str();
+            // 视觉 / 普通 的字符级样式
+            let (nchars, vis_style) = match &self.mode {
+                Mode::Visual(v) => {
+                    let nchars = text.chars().count();
+                    let (lo, hi, empty) = visual_range(v, line1, cursor_line1, nchars);
+                    (
+                        nchars,
+                        Some(WinRowStyle::Visual {
+                            marker: is_cursor,
+                            cur_char: if is_cursor { Some(v.cur_col) } else { None },
+                            lo,
+                            hi,
+                            empty,
+                        }),
                     )
-                };
-                let segs: Vec<String> = if fc.wrap {
-                    if UnicodeWidthStr::width(text) <= budget1 {
-                        vec![text.to_string()]
-                    } else {
-                        wrap_cols(text, budget1)
-                    }
-                } else {
-                    vec![text.to_string()]
-                };
-                let cur_st = Style::new()
-                    .bg(self.theme.cursor_line_bg)
-                    .fg(self.theme.cursor_line_text);
-                let sel_st = Style::new().bg(Color::DarkGray).fg(Color::White);
-                let plain_st = Style::new().fg(self.theme.text);
-                let mut gi = 0usize; // 全局字符下标（跨段累计）
-                for (k, seg) in segs.iter().enumerate() {
-                    let mut spans: Vec<Span> = Vec::new();
-                    if k == 0 {
-                        spans.push(Span::styled(
-                            if is_cursor { "▶" } else { " " },
-                            Style::new()
-                                .fg(self.theme.cursor_marker)
-                                .add_modifier(Modifier::BOLD),
-                        ));
-                        spans.push(Span::styled(
-                            format!("{line1:>ln_w$}"),
-                            Style::new()
-                                .fg(self.theme.line_number)
-                                .add_modifier(Modifier::DIM),
-                        ));
-                    } else {
-                        spans.push(Span::styled(
-                            "↪",
-                            Style::new()
-                                .fg(self.theme.line_number)
-                                .add_modifier(Modifier::DIM),
-                        ));
-                        spans.push(Span::styled(
-                            " ".repeat(ln_w),
-                            Style::new().fg(self.theme.line_number),
-                        ));
-                    }
-                    spans.push(dim_ln());
-                    for ch in seg.chars() {
-                        let st = if Some(gi) == cur_cell {
-                            cur_st.clone()
-                        } else if !empty_sel && gi >= lo && gi < hi {
-                            sel_st.clone()
-                        } else {
-                            plain_st.clone()
-                        };
-                        spans.push(Span::styled(ch.to_string(), st));
-                        gi += 1;
-                    }
-                    // 光标位于行尾后：在本行最后一段尾部追加空格光标块
-                    if is_cursor
-                        && cur_cell.unwrap_or(0) >= nchars
-                        && k + 1 == segs.len()
-                    {
-                        spans.push(Span::styled(" ", cur_st.clone()));
-                    }
-                    lines.push(Line::from(spans));
                 }
-                continue;
+                _ => (
+                    0,
+                    Some(WinRowStyle::Normal {
+                        marker: is_cursor,
+                        hl: fc.hl.as_ref(),
+                        cursor_col: if is_cursor { Some(fc.cur_col) } else { None },
+                    }),
+                ),
+            };
+            let _ = nchars;
+            if let Some(st) = vis_style {
+                Self::push_char_row(
+                    &mut lines,
+                    line1,
+                    ln_w,
+                    text,
+                    budget1,
+                    fc.hscroll,
+                    fc.wrap,
+                    st,
+                    &self.theme,
+                    kw,
+                );
             }
-            // 普通模式：整行光标蓝底 + 关键字高亮
-            let cur_arg = is_cursor;
-            Self::push_row_lines(
-                &mut lines,
-                line1.to_string(),
-                ln_w,
-                cur_arg,
-                &row.text,
-                fc.hscroll,
-                fc.wrap,
-                budget1,
-                fc.hl.as_ref(),
-                &self.theme,
-                kw,
-                false,
-                is_cursor,
-            );
         }
         lines
+    }
+
+    #[allow(dead_code)]
+    /// 软换行 + 视觉模式：整行按窗口宽分多段，逐字符上色（选区灰底 / 光标蓝格）。
+    fn push_wrap_visual(
+        out: &mut Vec<Line<'static>>,
+        line1: u64,
+        no_width: usize,
+        text: &str,
+        budget: usize,
+        cur_cell: Option<usize>,
+        lo: usize,
+        hi: usize,
+        empty: bool,
+        marker: bool,
+        theme: &crate::theme::Theme,
+    ) {
+        let nchars = text.chars().count();
+        let dim_ln = || -> Span<'static> {
+            Span::styled(
+                "│",
+                Style::new()
+                    .fg(theme.line_number)
+                    .add_modifier(Modifier::DIM),
+            )
+        };
+        let segs: Vec<String> = if UnicodeWidthStr::width(text) <= budget {
+            vec![text.to_string()]
+        } else {
+            wrap_cols(text, budget)
+        };
+        let cur_st = Style::new()
+            .bg(theme.cursor_line_bg)
+            .fg(theme.cursor_line_text);
+        let sel_st = Style::new().bg(Color::DarkGray).fg(Color::White);
+        let plain_st = Style::new().fg(theme.text);
+        let mut gi = 0usize;
+        for (k, seg) in segs.iter().enumerate() {
+            let mut spans: Vec<Span> = Vec::new();
+            if k == 0 {
+                spans.push(Span::styled(
+                    if marker { "▶" } else { " " },
+                    Style::new()
+                        .fg(theme.cursor_marker)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    format!("{line1:>no_width$}"),
+                    Style::new()
+                        .fg(theme.line_number)
+                        .add_modifier(Modifier::DIM),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "↪",
+                    Style::new()
+                        .fg(theme.line_number)
+                        .add_modifier(Modifier::DIM),
+                ));
+                spans.push(Span::styled(
+                    " ".repeat(no_width),
+                    Style::new().fg(theme.line_number),
+                ));
+            }
+            spans.push(dim_ln());
+            for ch in seg.chars() {
+                let st = if Some(gi) == cur_cell {
+                    cur_st.clone()
+                } else if !empty && gi >= lo && gi < hi {
+                    sel_st.clone()
+                } else {
+                    plain_st.clone()
+                };
+                spans.push(Span::styled(ch.to_string(), st));
+                gi += 1;
+            }
+            if cur_cell.map(|c| c >= nchars).unwrap_or(false) && k + 1 == segs.len() {
+                spans.push(Span::styled(" ", cur_st.clone()));
+            }
+            out.push(Line::from(spans));
+        }
+    }
+
+    #[allow(dead_code)]
+    /// 非软换行：水平滚动窗口内的逐字符行渲染。
+    /// 样式由 WinRowStyle 决定（普通=关键字高亮+列光标格；视觉=字符选区+光标格）。
+    fn push_window_row(
+        out: &mut Vec<Line<'static>>,
+        line1: u64,
+        no_width: usize,
+        text: &str,
+        hscroll: usize,
+        budget: usize,
+        style: WinRowStyle<'_>,
+        theme: &crate::theme::Theme,
+        kw: Color,
+    ) {
+        let text_w = UnicodeWidthStr::width(text);
+        // 光标所在显示列（仅光标行有值）：普通=fc.cur_col；视觉=cur_char 换算列
+        let cur_col_disp: Option<usize> = match &style {
+            WinRowStyle::Normal {
+                cursor_col: Some(cc),
+                ..
+            } => Some(*cc),
+            WinRowStyle::Visual {
+                cur_char: Some(cc),
+                ..
+            } => {
+                let n = text.chars().count();
+                Some(char_to_col(text, (*cc).min(n)))
+            }
+            _ => None,
+        };
+        // 显示窗口起始列：光标行把光标框进窗口；其它行沿用 hscroll（右界含行尾 1 列）
+        let target = if text_w <= budget {
+            0
+        } else if let Some(cc) = cur_col_disp {
+            ensure_hs(hscroll, cc, budget, text_w)
+        } else {
+            ensure_hs(hscroll, hscroll, budget, text_w)
+        };
+        let (start_char, start_b) = if target > 0 {
+            let c = col_to_char(text, target);
+            let b = text
+                .char_indices()
+                .nth(c)
+                .map(|(bi, _)| bi)
+                .unwrap_or(text.len());
+            (c, b)
+        } else {
+            (0usize, 0usize)
+        };
+        let start_col = char_to_col(text, start_char);
+        let win = &text[start_b..];
+        let win_end = byte_after_cols(win, budget);
+        let win = &win[..win_end];
+        let marker = match &style {
+            WinRowStyle::Normal { marker, .. } => *marker,
+            WinRowStyle::Visual { marker, .. } => *marker,
+        };
+        // hl 高亮范围（普通模式；作用于窗口文本的局部字节）
+        let hl_ranges: Vec<(usize, usize)> = match &style {
+            WinRowStyle::Normal { hl: Some(r), .. } => {
+                r.find_iter(win).map(|m| (m.start(), m.end())).collect()
+            }
+            _ => Vec::new(),
+        };
+        let mut spans: Vec<Span> = Vec::new();
+        spans.push(Span::styled(
+            if marker { "▶" } else { " " },
+            Style::new()
+                .fg(theme.cursor_marker)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!("{line1:>no_width$}│"),
+            Style::new()
+                .fg(theme.line_number)
+                .add_modifier(Modifier::DIM),
+        ));
+        let cur_st = Style::new()
+            .bg(theme.cursor_line_bg)
+            .fg(theme.cursor_line_text);
+        let sel_st = Style::new().bg(Color::DarkGray).fg(Color::White);
+        let kw_st = Style::new().fg(kw);
+        let plain_st = Style::new().fg(theme.text);
+        let mut gi = start_char;
+        let mut col = start_col;
+        let mut run_start = 0usize;
+        let mut run_kind: u8 = 0;
+        let mut flush = |spans: &mut Vec<Span>,
+                         win: &str,
+                         run_start: &mut usize,
+                         end: usize,
+                         kind: u8|
+         -> () {
+            if end > *run_start {
+                let st = match kind {
+                    1 => kw_st.clone(),
+                    2 => sel_st.clone(),
+                    3 => cur_st.clone(),
+                    _ => plain_st.clone(),
+                };
+                spans.push(Span::styled(win[*run_start..end].to_string(), st));
+            }
+            *run_start = end;
+        };
+        for (b, ch) in win.char_indices() {
+            let w = ch.width().unwrap_or(1);
+            let kind: u8 = match &style {
+                WinRowStyle::Normal {
+                    cursor_col: Some(cc),
+                    ..
+                } if *cc == col => 3,
+                WinRowStyle::Normal { hl: Some(_), .. }
+                    if hl_ranges.iter().any(|(s, e)| b >= *s && b < *e) =>
+                {
+                    1
+                }
+                WinRowStyle::Visual {
+                    cur_char: Some(cc),
+                    ..
+                } if *cc == gi => 3,
+                WinRowStyle::Visual {
+                    empty: false, lo, hi, ..
+                } if gi >= *lo && gi < *hi => 2,
+                _ => 0,
+            };
+            if kind != run_kind {
+                flush(&mut spans, win, &mut run_start, b, run_kind);
+                run_kind = kind;
+            }
+            col += w;
+            gi += 1;
+        }
+        flush(&mut spans, win, &mut run_start, win.len(), run_kind);
+        // 行尾后的光标：光标行且光标列在行尾后 → 行尾追加空格光标块
+        let tail_cursor = match &style {
+            WinRowStyle::Normal {
+                cursor_col: Some(cc),
+                marker: true,
+                ..
+            } => *cc >= text_w,
+            WinRowStyle::Visual {
+                cur_char: Some(cc),
+                marker: true,
+                ..
+            } => *cc >= text.chars().count(),
+            _ => false,
+        };
+        if tail_cursor && start_col + UnicodeWidthStr::width(win) >= text_w {
+            spans.push(Span::styled(" ", cur_st.clone()));
+        }
+        out.push(Line::from(spans));
+    }
+
+    /// 逐字符行渲染（wrap=软换行多段全展 / 非 wrap=水平窗口单段）。
+    /// 样式：普通=关键字高亮+列光标格；视觉=字符选区+光标格。
+    fn push_char_row(
+        out: &mut Vec<Line<'static>>,
+        line1: u64,
+        no_width: usize,
+        text: &str,
+        budget: usize,
+        hscroll: usize,
+        wrap: bool,
+        style: WinRowStyle<'_>,
+        theme: &crate::theme::Theme,
+        kw: Color,
+    ) {
+        let text_w = UnicodeWidthStr::width(text);
+        let nchars = text.chars().count();
+        // 光标所在显示列（Normal=cursor_col；Visual=cur_char 换算列），用于非 wrap 窗口定位
+        let cur_col_disp: Option<usize> = match &style {
+            WinRowStyle::Normal {
+                cursor_col: Some(cc),
+                ..
+            } => Some(*cc),
+            WinRowStyle::Visual {
+                cur_char: Some(cc),
+                ..
+            } => Some(char_to_col(text, (*cc).min(nchars))),
+            _ => None,
+        };
+        let mut parts: Vec<(String, usize, usize)> = Vec::new();
+        if wrap {
+            if text_w <= budget {
+                parts.push((text.to_string(), 0, 0));
+            } else {
+                let mut acc_char = 0usize;
+                let mut acc_col = 0usize;
+                let mut rest = text;
+                while UnicodeWidthStr::width(rest) > budget {
+                    let cut = byte_after_cols(rest, budget).max(1);
+                    let seg = &rest[..cut];
+                    let seg_w = UnicodeWidthStr::width(seg);
+                    parts.push((seg.to_string(), acc_char, acc_col));
+                    acc_char += seg.chars().count();
+                    acc_col += seg_w;
+                    rest = &rest[cut..];
+                }
+                if !rest.is_empty() {
+                    parts.push((rest.to_string(), acc_char, acc_col));
+                }
+            }
+        } else {
+            // 非 wrap：水平窗口段
+            let target = if text_w <= budget {
+                0
+            } else if let Some(cc) = cur_col_disp {
+                ensure_hs(hscroll, cc, budget, text_w)
+            } else {
+                ensure_hs(hscroll, hscroll, budget, text_w)
+            };
+            let start_char = if target > 0 {
+                col_to_char(text, target)
+            } else {
+                0
+            };
+            let start_b = text
+                .char_indices()
+                .nth(start_char)
+                .map(|(bi, _)| bi)
+                .unwrap_or(text.len());
+            let start_col = char_to_col(text, start_char);
+            let win = &text[start_b..];
+            let win_end = byte_after_cols(win, budget);
+            parts.push((win[..win_end].to_string(), start_char, start_col));
+        }
+        let cur_st = Style::new()
+            .bg(theme.cursor_line_bg)
+            .fg(theme.cursor_line_text);
+        let sel_st = Style::new().bg(Color::DarkGray).fg(Color::White);
+        let kw_st = Style::new().fg(kw);
+        let plain_st = Style::new().fg(theme.text);
+        let marker = match &style {
+            WinRowStyle::Normal { marker, .. } => *marker,
+            WinRowStyle::Visual { marker, .. } => *marker,
+        };
+        let tail_cursor = match &style {
+            WinRowStyle::Normal {
+                cursor_col: Some(cc),
+                marker: true,
+                ..
+            } => *cc >= text_w,
+            WinRowStyle::Visual {
+                cur_char: Some(cc),
+                marker: true,
+                ..
+            } => *cc >= nchars,
+            _ => false,
+        };
+        let nparts = parts.len();
+        for (k, (seg, base_char, base_col)) in parts.iter().enumerate() {
+            let mut spans: Vec<Span> = Vec::new();
+            if k == 0 {
+                spans.push(Span::styled(
+                    if marker { "▶" } else { " " },
+                    Style::new()
+                        .fg(theme.cursor_marker)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    format!("{line1:>no_width$}│"),
+                    Style::new()
+                        .fg(theme.line_number)
+                        .add_modifier(Modifier::DIM),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "↪",
+                    Style::new()
+                        .fg(theme.line_number)
+                        .add_modifier(Modifier::DIM),
+                ));
+                spans.push(Span::styled(
+                    " ".repeat(no_width),
+                    Style::new().fg(theme.line_number),
+                ));
+                spans.push(Span::styled(
+                    "│",
+                    Style::new()
+                        .fg(theme.line_number)
+                        .add_modifier(Modifier::DIM),
+                ));
+            }
+            // 关键字高亮范围（段内局部字节）
+            let hl_ranges: Vec<(usize, usize)> = match &style {
+                WinRowStyle::Normal { hl: Some(r), .. } => r
+                    .find_iter(seg)
+                    .map(|m| (m.start(), m.end()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let mut gi = *base_char;
+            let mut col = *base_col;
+            let mut run_start = 0usize;
+            let mut run_kind: u8 = 0;
+            for (b, ch) in seg.char_indices() {
+                let w = ch.width().unwrap_or(1);
+                let kind: u8 = match &style {
+                    WinRowStyle::Normal {
+                        cursor_col: Some(cc),
+                        ..
+                    } if *cc == col => 3,
+                    WinRowStyle::Normal { hl: Some(_), .. }
+                        if hl_ranges.iter().any(|(s, e)| b >= *s && b < *e) =>
+                    {
+                        1
+                    }
+                    WinRowStyle::Visual {
+                        cur_char: Some(cc),
+                        ..
+                    } if *cc == gi => 3,
+                    WinRowStyle::Visual {
+                        empty: false, lo, hi, ..
+                    } if gi >= *lo && gi < *hi => 2,
+                    _ => 0,
+                };
+                if kind != run_kind {
+                    if run_start < b {
+                        let st = match run_kind {
+                            1 => kw_st.clone(),
+                            2 => sel_st.clone(),
+                            3 => cur_st.clone(),
+                            _ => plain_st.clone(),
+                        };
+                        spans.push(Span::styled(seg[run_start..b].to_string(), st));
+                    }
+                    run_start = b;
+                    run_kind = kind;
+                }
+                col += w;
+                gi += 1;
+            }
+            if run_start < seg.len() {
+                let st = match run_kind {
+                    1 => kw_st.clone(),
+                    2 => sel_st.clone(),
+                    3 => cur_st.clone(),
+                    _ => plain_st.clone(),
+                };
+                spans.push(Span::styled(seg[run_start..].to_string(), st));
+            }
+            // 行尾后的光标格（最后一格）
+            if tail_cursor && k + 1 == nparts {
+                if !wrap {
+                    // 非 wrap：仅当窗口已显示到行尾才追加（否则不可见位置）
+                    if *base_col + UnicodeWidthStr::width(seg.as_str()) >= text_w {
+                        spans.push(Span::styled(" ", cur_st.clone()));
+                    }
+                } else {
+                    spans.push(Span::styled(" ", cur_st.clone()));
+                }
+            }
+            out.push(Line::from(spans));
+        }
     }
 
     /// 结果窗渲染：按视口行号从主视图逐行读取原文后排版（文本不驻留）。
