@@ -152,7 +152,9 @@ pub enum Mode {
 /// 视觉选择状态（作用于主文件窗）。
 pub struct VisualState {
     kind: VisualKind,
-    /// 起始行（1-based）
+    /// 视觉作用窗格（0=主文件窗，行坐标=逻辑行号；>0=匹配窗，行坐标=rows 下标）
+    pane: usize,
+    /// 起始行（1-based，语义随 pane：文件窗=行号 / 匹配窗=列表下标）
     anchor_row: u64,
     /// 起始列（字符下标，含）
     anchor_col: usize,
@@ -193,30 +195,52 @@ fn visual_range(
     cursor_line1: u64,
     nchars: usize,
 ) -> (usize, usize, bool) {
-    let r1 = v.anchor_row.min(cursor_line1);
-    let r2 = v.anchor_row.max(cursor_line1);
+    visual_range_p(
+        v.anchor_row,
+        v.anchor_col,
+        v.cur_col,
+        v.kind,
+        line1,
+        cursor_line1,
+        nchars,
+    )
+}
+
+/// visual_range 的参数化版本（供无 &VisualState 的静态渲染路径使用）。
+#[allow(clippy::too_many_arguments)]
+fn visual_range_p(
+    anchor_row: u64,
+    anchor_col: usize,
+    cur_col: usize,
+    kind: VisualKind,
+    line1: u64,
+    cursor_line1: u64,
+    nchars: usize,
+) -> (usize, usize, bool) {
+    let r1 = anchor_row.min(cursor_line1);
+    let r2 = anchor_row.max(cursor_line1);
     let lo_hi = if line1 < r1 || line1 > r2 {
         None
-    } else if v.kind == VisualKind::Line {
+    } else if kind == VisualKind::Line {
         Some((0usize, nchars))
-    } else if v.kind == VisualKind::Block {
-        let (c1, c2) = (v.anchor_col.min(v.cur_col), v.anchor_col.max(v.cur_col));
+    } else if kind == VisualKind::Block {
+        let (c1, c2) = (anchor_col.min(cur_col), anchor_col.max(cur_col));
         Some((c1.min(nchars), (c2 + 1).min(nchars)))
     } else if r1 == r2 {
-        let (c1, c2) = (v.anchor_col.min(v.cur_col), v.anchor_col.max(v.cur_col));
+        let (c1, c2) = (anchor_col.min(cur_col), anchor_col.max(cur_col));
         Some((c1.min(nchars), (c2 + 1).min(nchars)))
     } else if line1 == r1 {
-        let edge = if v.anchor_row == r1 {
-            v.anchor_col
+        let edge = if anchor_row == r1 {
+            anchor_col
         } else {
-            v.cur_col
+            cur_col
         };
         Some((edge.min(nchars), nchars))
     } else if line1 == r2 {
-        let edge = if v.anchor_row == r2 {
-            v.anchor_col
+        let edge = if anchor_row == r2 {
+            anchor_col
         } else {
-            v.cur_col
+            cur_col
         };
         Some((0, (edge + 1).min(nchars)))
     } else {
@@ -330,6 +354,8 @@ pub struct MatchesContent {
     inner_h: usize,
     /// 水平滚动列数
     hscroll: usize,
+    /// 光标所在显示列（选中行的列光标，wrap 关闭时参与水平窗口）
+    cur_col: usize,
     /// 自动换行显示
     wrap: bool,
 }
@@ -381,6 +407,7 @@ impl Pane {
                 top: 0,
                 inner_h: 24,
                 hscroll: 0,
+                cur_col: 0,
                 wrap: false,
             }),
         }
@@ -864,6 +891,7 @@ impl App {
             top: 0,
             inner_h: 24,
             hscroll: 0,
+            cur_col: 0,
             wrap: false,
         });
         self.focus = idx;
@@ -1067,43 +1095,89 @@ fn slice_chars(s: &str, from: usize, to_excl: usize) -> String {
 
 impl App {
     fn start_visual(&mut self, kind: crate::app::VisualKind) {
-        if self.focus != 0 {
-            self.set_msg("视觉选择仅支持主文件窗");
-            return;
-        }
-        let (row, cur_col) = {
-            let Content::File(fc) = &self.panes[0].content else {
+        // 文件窗或匹配窗均可进入视觉选择（视觉作用窗 = 当前焦点窗，行坐标语义随窗）
+        let pane = self.focus;
+        let is_file = matches!(&self.panes[pane].content, Content::File(_));
+        // 行坐标 / 该行行号 / 列光标（文本读取需先释放借用再调 main_read_line）
+        let (row, line_no, cur_col): (u64, u64, usize) = if is_file {
+            let Content::File(fc) = &self.panes[pane].content else {
                 return;
             };
-            (fc.view.cursor_line1(), fc.cur_col)
+            let r = fc.view.cursor_line1();
+            (r, r, fc.cur_col)
+        } else {
+            let Content::Matches(mc) = &self.panes[pane].content else {
+                return;
+            };
+            if mc.rows.is_empty() {
+                self.set_msg("空列表无可选择内容");
+                return;
+            }
+            let s = mc.sel;
+            (s as u64, mc.rows[s].line_no, mc.cur_col)
         };
-        // 视觉从列光标处开始（wrap 开/关均适用）
-        let start_char = match self.main_read_line(row) {
+        // 视觉起点列（文件/匹配窗一致：列光标 → 字符下标）
+        let start_char = match self.main_read_line(line_no) {
             Some(t) => col_to_char(&t, cur_col),
             None => 0,
         };
         self.mode = Mode::Visual(VisualState {
             kind,
+            pane,
             anchor_row: row,
             anchor_col: start_char,
             cur_col: start_char,
         });
     }
 
-    /// 当前光标行文本的字符数（用于列移动 clamp）
+    /// 视觉当前行文本的字符数（用于列移动 clamp）
     fn visual_cur_len(&mut self) -> usize {
-        let row = {
-            let Content::File(fc) = &self.panes[0].content else {
-                return 0;
+        self.visual_row_text().map(|t| t.chars().count()).unwrap_or(0)
+    }
+
+    /// 视觉当前所在行的原文文本（文件窗=光标行；匹配窗=当前选中行的原始行）。
+    fn visual_row_text(&mut self) -> Option<String> {
+        let p = {
+            let Mode::Visual(v) = &self.mode else {
+                return None;
             };
-            fc.view.cursor_line1()
+            v.pane
         };
-        self.main_read_line(row).map(|t| t.chars().count()).unwrap_or(0)
+        let row: u64 = match &self.panes[p].content {
+            Content::File(fc) => fc.view.cursor_line1(),
+            Content::Matches(mc) => {
+                if mc.rows.is_empty() {
+                    return None;
+                }
+                let i = mc.sel.min(mc.rows.len() - 1);
+                mc.rows[i].line_no
+            }
+        };
+        self.main_read_line(row)
     }
 
     fn visual_move_row(&mut self, dir: i64) {
-        if let Content::File(fc) = &mut self.panes[0].content {
-            fc.view.move_cursor(dir);
+        let p = {
+            let Mode::Visual(v) = &self.mode else {
+                return;
+            };
+            v.pane
+        };
+        // 移动窗内行光标（文件=逻辑行；匹配=列表选中行）
+        if p == 0 {
+            if let Content::File(fc) = &mut self.panes[0].content {
+                fc.view.move_cursor(dir);
+            }
+        } else if let Content::Matches(mc) = &mut self.panes[p].content {
+            let n = mc.rows.len();
+            if n > 0 {
+                mc.sel = if dir < 0 {
+                    mc.sel.saturating_sub(1)
+                } else {
+                    (mc.sel + 1).min(n - 1)
+                };
+                mc.keep_visible();
+            }
         }
         let len = self.visual_cur_len();
         if let Mode::Visual(v) = &mut self.mode {
@@ -1176,22 +1250,33 @@ impl App {
 
     /// 复制选区到系统剪贴板并退出视觉模式。
     fn visual_yank(&mut self) {
-        let (kind, a_row, a_col, b_col) = match &self.mode {
-            Mode::Visual(v) => (v.kind, v.anchor_row, v.anchor_col, v.cur_col),
+        let (kind, pane, a_row, a_col, b_col) = match &self.mode {
+            Mode::Visual(v) => (v.kind, v.pane, v.anchor_row, v.anchor_col, v.cur_col),
             _ => return,
         };
-        let cur_row = {
-            let Content::File(fc) = &self.panes[0].content else {
-                return;
-            };
-            fc.view.cursor_line1()
+        let cur_row: u64 = match &self.panes[pane].content {
+            Content::File(fc) => fc.view.cursor_line1(),
+            Content::Matches(mc) => mc.sel as u64,
+            _ => return,
         };
         let r1 = a_row.min(cur_row);
         let r2 = a_row.max(cur_row);
+        // 收集选区行的原始行号（文件窗=行号本身；匹配窗=rows 下标 → line_no）
+        let line_nos: Vec<u64> = match &self.panes[pane].content {
+            Content::File(_) => (r1..=r2).collect(),
+            Content::Matches(mc) => {
+                let n = mc.rows.len();
+                let a = (r1 as usize).min(n);
+                let b = (r2 as usize).min(n);
+                mc.rows[a..=b.max(a)].iter().map(|m| m.line_no).collect()
+            }
+            _ => return,
+        };
         let mut lines: Vec<String> = Vec::new();
-        for r in r1..=r2 {
-            lines.push(self.main_read_line(r).unwrap_or_default());
+        for no in &line_nos {
+            lines.push(self.main_read_line(*no).unwrap_or_default());
         }
+        let n_rows = line_nos.len();
         let out: String = match kind {
             crate::app::VisualKind::Line => {
                 let mut s = lines.join("\n");
@@ -1208,7 +1293,7 @@ impl App {
             }
             crate::app::VisualKind::Char => {
                 let (c1, c2) = (a_col.min(b_col), a_col.max(b_col));
-                if r1 == r2 {
+                if lines.len() == 1 {
                     slice_chars(&lines[0], c1, c2 + 1)
                 } else {
                     let mut s = slice_chars(&lines[0], c1, usize::MAX);
@@ -1233,8 +1318,7 @@ impl App {
         self.mode = Mode::Normal;
         if copied {
             self.set_msg(format!(
-                "已复制 {} 行 / {} 字符到系统剪贴板",
-                r2 - r1 + 1,
+                "已复制 {n_rows} 行 / {} 字符到系统剪贴板",
                 out.chars().count()
             ));
         } else {
@@ -1312,8 +1396,13 @@ impl App {
             self.cancel_jump("cancelled: jump");
             return;
         }
-        // 视觉选择进入（仅主文件窗）
-        if self.focus == 0 {
+        // 视觉选择进入（文件窗或匹配窗）
+        let visual_ok = self.focus < self.panes.len()
+            && matches!(
+                &self.panes[self.focus].content,
+                Content::File(_) | Content::Matches(_)
+            );
+        if visual_ok {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
                 KeyCode::Char('v') if ctrl => {
@@ -1411,6 +1500,8 @@ impl App {
             A::HLeft => {
                 if self.is_main_file() {
                     self.file_col_move(-1);
+                } else if self.is_matches_focus() {
+                    self.matches_col_move(-1);
                 } else {
                     self.pane_hscroll(-8);
                 }
@@ -1418,6 +1509,8 @@ impl App {
             A::HRight => {
                 if self.is_main_file() {
                     self.file_col_move(1);
+                } else if self.is_matches_focus() {
+                    self.matches_col_move(1);
                 } else {
                     self.pane_hscroll(8);
                 }
@@ -1425,6 +1518,8 @@ impl App {
             A::HHome => {
                 if self.is_main_file() {
                     self.file_col_home();
+                } else if self.is_matches_focus() {
+                    self.matches_col_home();
                 } else {
                     self.pane_hscroll(0);
                 }
@@ -1432,6 +1527,8 @@ impl App {
             A::HEnd => {
                 if self.is_main_file() {
                     self.file_col_end();
+                } else if self.is_matches_focus() {
+                    self.matches_col_end();
                 } else {
                     self.pane_goto_eol();
                 }
@@ -1501,6 +1598,100 @@ impl App {
             &self.panes[0].content,
             Content::File(fc) if !fc.wrap
         )
+    }
+
+    /// 焦点是否为匹配窗。
+    fn is_matches_focus(&self) -> bool {
+        self.focus > 0
+            && matches!(&self.panes[self.focus].content, Content::Matches(_))
+    }
+
+    /// 匹配窗列光标水平移动（等价主窗 P2 语义；行文本取原始行）。
+    fn matches_col_move(&mut self, delta: i64) {
+        if !self.is_matches_focus() {
+            return;
+        }
+        let (no, wrap, cur_col, ln_w) = {
+            let Content::Matches(mc) = &self.panes[self.focus].content else {
+                return;
+            };
+            if mc.rows.is_empty() {
+                return;
+            }
+            let ln_w = mc
+                .rows
+                .last()
+                .map(|m| m.line_no.to_string().len())
+                .unwrap_or(6)
+                .max(4);
+            (mc.rows[mc.sel].line_no, mc.wrap, mc.cur_col, ln_w)
+        };
+        let Some(t) = self.main_read_line(no) else {
+            return;
+        };
+        let tw = UnicodeWidthStr::width(t.as_str());
+        let n = t.chars().count();
+        let ci_now = col_to_char(&t, cur_col.min(tw));
+        let ci_new = if delta > 0 {
+            if ci_now >= n {
+                n
+            } else {
+                ci_now + 1
+            }
+        } else {
+            ci_now.saturating_sub(1)
+        };
+        let new_col = char_to_col(&t, ci_new);
+        let Content::Matches(mc) = &mut self.panes[self.focus].content else {
+            return;
+        };
+        mc.cur_col = new_col;
+        if !wrap {
+            let budget = self.last_cols.saturating_sub(1 + ln_w + 1).max(4);
+            mc.hscroll = ensure_hs(mc.hscroll, new_col, budget, tw);
+        }
+    }
+
+    fn matches_col_home(&mut self) {
+        if !self.is_matches_focus() {
+            return;
+        }
+        if let Content::Matches(mc) = &mut self.panes[self.focus].content {
+            mc.cur_col = 0;
+            mc.hscroll = 0;
+        }
+    }
+
+    fn matches_col_end(&mut self) {
+        if !self.is_matches_focus() {
+            return;
+        }
+        let (no, wrap, ln_w) = {
+            let Content::Matches(mc) = &self.panes[self.focus].content else {
+                return;
+            };
+            if mc.rows.is_empty() {
+                return;
+            }
+            let ln_w = mc
+                .rows
+                .last()
+                .map(|m| m.line_no.to_string().len())
+                .unwrap_or(6)
+                .max(4);
+            (mc.rows[mc.sel].line_no, mc.wrap, ln_w)
+        };
+        let Some(t) = self.main_read_line(no) else {
+            return;
+        };
+        let tw = UnicodeWidthStr::width(t.as_str());
+        if let Content::Matches(mc) = &mut self.panes[self.focus].content {
+            mc.cur_col = tw;
+            if !wrap {
+                let budget = self.last_cols.saturating_sub(1 + ln_w + 1).max(4);
+                mc.hscroll = ensure_hs(mc.hscroll, tw, budget, tw);
+            }
+        }
     }
 
     /// 文件窗列光标水平移动（h=左 l=右，钳制在当前行内；wrap 关闭时窗口跟随）。
@@ -2792,6 +2983,13 @@ impl App {
                 Style::default().fg(self.theme.inactive_border)
             });
         let cols = rect.width.saturating_sub(2).max(1);
+        // 视觉选择上下文（仅当作用于本子窗 idx>0 时）
+        let vis: Option<(u64, usize, usize, crate::app::VisualKind)> = match &self.mode {
+            Mode::Visual(v) if v.pane == idx => {
+                Some((v.anchor_row, v.anchor_col, v.cur_col, v.kind))
+            }
+            _ => None,
+        };
         let content = if idx == 0 {
             let fc = match &self.panes[0].content {
                 Content::File(fc) => fc,
@@ -2804,15 +3002,21 @@ impl App {
                 &mut head[0].content,
                 rest.get_mut(idx - 1).map(|p| &mut p.content),
             ) {
-                (Content::File(pf), Some(Content::Matches(mc))) => {
-                    Self::build_matches_lines(&mut pf.view, mc, cols, &self.theme, self.opts)
-                }
+                (Content::File(pf), Some(Content::Matches(mc))) => Self::build_matches_lines(
+                    &mut pf.view,
+                    mc,
+                    cols,
+                    &self.theme,
+                    self.opts,
+                    vis,
+                ),
                 _ => Vec::new(),
             }
         };
         frame.render_widget(Paragraph::new(content).block(block), rect);
     }
 
+    #[allow(dead_code)]
     /// 把一行内容排成可视行（支持水平滚动或软换行），返回 span 列表与续行。
     /// budget_first/budget_cont 为内容可用列数（不含前缀）。
     fn push_row_lines(
@@ -2920,32 +3124,25 @@ impl App {
             let line1 = top + i as u64;
             let is_cursor = cursor_line1 == line1;
             let text = row.text.as_str();
-            // 视觉 / 普通 的字符级样式
-            let (nchars, vis_style) = match &self.mode {
-                Mode::Visual(v) => {
+            // 视觉 / 普通 的字符级样式（视觉仅作用于主文件窗 pane==0 时生效）
+            let vis_style = match &self.mode {
+                Mode::Visual(v) if v.pane == 0 => {
                     let nchars = text.chars().count();
                     let (lo, hi, empty) = visual_range(v, line1, cursor_line1, nchars);
-                    (
-                        nchars,
-                        Some(WinRowStyle::Visual {
-                            marker: is_cursor,
-                            cur_char: if is_cursor { Some(v.cur_col) } else { None },
-                            lo,
-                            hi,
-                            empty,
-                        }),
-                    )
-                }
-                _ => (
-                    0,
-                    Some(WinRowStyle::Normal {
+                    Some(WinRowStyle::Visual {
                         marker: is_cursor,
-                        hl: fc.hl.as_ref(),
-                        cursor_col: if is_cursor { Some(fc.cur_col) } else { None },
-                    }),
-                ),
+                        cur_char: if is_cursor { Some(v.cur_col) } else { None },
+                        lo,
+                        hi,
+                        empty,
+                    })
+                }
+                _ => Some(WinRowStyle::Normal {
+                    marker: is_cursor,
+                    hl: fc.hl.as_ref(),
+                    cursor_col: if is_cursor { Some(fc.cur_col) } else { None },
+                }),
             };
-            let _ = nchars;
             if let Some(st) = vis_style {
                 Self::push_char_row(
                     &mut lines,
@@ -3408,6 +3605,7 @@ impl App {
         cols: u16,
         theme: &crate::theme::Theme,
         opts: SearchPrefs,
+        vis: Option<(u64, usize, usize, crate::app::VisualKind)>,
     ) -> Vec<Line<'static>> {
         if mc.rows.is_empty() {
             return vec![Line::from(Span::styled(
@@ -3434,21 +3632,48 @@ impl App {
             let no = mc.rows[ri].line_no;
             let text = view.read_line_text(no).unwrap_or_default();
             let cur = ri == mc.sel;
-            Self::push_row_lines(
-                &mut lines,
-                no.to_string(),
-                ln_w,
-                cur,
-                &text,
-                mc.hscroll,
-                mc.wrap,
-                budget1,
-                hl_re.as_ref(),
-                theme,
-                kw,
-                false,
-                cur,
-            );
+            if let Some((a_row, a_col, b_col, kind)) = vis {
+                // 视觉作用于本子窗：按列表下标行范围 + 字符选区逐字符渲染
+                let nchars = text.chars().count();
+                let (lo, hi, empty) =
+                    visual_range_p(a_row, a_col, b_col, kind, ri as u64, mc.sel as u64, nchars);
+                Self::push_char_row(
+                    &mut lines,
+                    no,
+                    ln_w,
+                    &text,
+                    budget1,
+                    mc.hscroll,
+                    mc.wrap,
+                    WinRowStyle::Visual {
+                        marker: cur,
+                        cur_char: if cur { Some(b_col) } else { None },
+                        lo,
+                        hi,
+                        empty,
+                    },
+                    theme,
+                    kw,
+                );
+            } else {
+                // 普通模式：字符级渲染 + 列光标格（当前选中行）
+                Self::push_char_row(
+                    &mut lines,
+                    no,
+                    ln_w,
+                    &text,
+                    budget1,
+                    mc.hscroll,
+                    mc.wrap,
+                    WinRowStyle::Normal {
+                        marker: cur,
+                        hl: hl_re.as_ref(),
+                        cursor_col: if cur { Some(mc.cur_col) } else { None },
+                    },
+                    theme,
+                    kw,
+                );
+            }
         }
         lines
     }
