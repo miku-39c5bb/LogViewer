@@ -42,6 +42,19 @@ fn byte_after_cols(s: &str, n: usize) -> usize {
     s.len()
 }
 
+/// 超长文本只保留开头若干列 + "..."（用于状态栏关键字等避免挤掉后续信息）。
+fn clip_str(s: &str, max_cols: usize) -> String {
+    if max_cols <= 3 {
+        return if s.is_empty() { String::new() } else { ".".repeat(max_cols) };
+    }
+    if UnicodeWidthStr::width(s) <= max_cols {
+        return s.to_string();
+    }
+    let keep = max_cols.saturating_sub(3);
+    let cut = byte_after_cols(s, keep);
+    format!("{}...", &s[..cut])
+}
+
 /// 取 s 中跳过 skip 列后、长度不超过 max 列的片段（整字符边界）。
 fn slice_cols(s: &str, skip: usize, max: usize) -> &str {
     if s.is_empty() || max == 0 {
@@ -2497,6 +2510,11 @@ impl App {
         if self.pending_jump.is_some() {
             text.push_str("[processing...]  ");
         }
+        // 关键字截断上限：随窗口列宽动态（窗口越窄/字体越大列数越少 → 上限越小）
+        let kw_lim = (area.width as usize)
+            .saturating_mul(18)
+            .saturating_div(100)
+            .clamp(14, 90);
         match &self.panes[self.focus].content {
             Content::File(fc) => {
                 let rows_n = fc.view.row_count();
@@ -2532,19 +2550,19 @@ impl App {
                         Ok(i) => format!("{}/{}", i + 1, total),
                         Err(_) => total,
                     };
-                    text.push_str(&format!("  {dir}{}  匹配 {seq}", a.pattern));
+                    text.push_str(&format!("  {dir}{}  匹配 {seq}", clip_str(&a.pattern, kw_lim)));
                 }
             }
             Content::Matches(mc) => {
                 text.push_str(&format!(
                     "{} 共 {} 行  选中原始行 {}",
-                    mc.tag,
+                    clip_str(&mc.tag, kw_lim),
                     mc.rows.len(),
                     mc.rows.get(mc.sel).map(|m| m.line_no).unwrap_or(0),
                 ));
                 if let Some((k, n)) = mc.search_pos() {
                     let q = mc.search.as_ref().unwrap();
-                    text.push_str(&format!("  匹配 {k}/{n}  {}", q.query));
+                    text.push_str(&format!("  匹配 {k}/{n}  {}", clip_str(&q.query, kw_lim)));
                 }
             }
         }
@@ -2587,21 +2605,68 @@ impl App {
             self.theme.prompt_back
         };
         let mut spans = vec![Span::styled(prompt, Style::new().fg(col))];
+        // 可视输入区宽度（扣除提示符占的 1 列）
+        let vis = (area.width as usize).saturating_sub(1);
+        let text = cs.buf.as_str();
         let cut = cs.cursor.min(cs.buf.len());
-        let before = &cs.buf[..cut];
-        let after = &cs.buf[cut..];
-        spans.push(Span::styled(before, Style::new().fg(col)));
+        let c_w = UnicodeWidthStr::width(&text[..cut]);
         let cur_style = Style::new()
             .fg(col)
             .add_modifier(Modifier::REVERSED);
-        match after.chars().next() {
-            Some(c) => {
-                spans.push(Span::styled(c.to_string(), cur_style));
-                spans.push(Span::styled(&after[c.len_utf8()..], Style::new().fg(col)));
+        let dim = || -> Span<'static> {
+            Span::styled(
+                "...",
+                Style::new()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            )
+        };
+        if vis > 0 {
+            let tw = vis;
+            let t_w = UnicodeWidthStr::width(text);
+            // 光标右侧是否还有内容（决定是否显示右侧省略号）
+            let right_need = c_w < t_w;
+            // 滚动与省略号预算互相影响：迭代两次收敛
+            let mut left_ell = false;
+            let mut avail = tw;
+            let mut scroll = 0usize;
+            for _ in 0..2 {
+                avail = tw
+                    .saturating_sub(3 * ((left_ell as usize) + (right_need as usize)))
+                    .max(1);
+                scroll = if c_w < avail { 0 } else { c_w - avail + 1 };
+                left_ell = scroll > 0;
             }
-            None => {
-                spans.push(Span::styled(" ", cur_style));
+            let right_ell = right_need;
+            // 从 scroll 列开始切 avail 列文本
+            let startb = byte_after_cols(text, scroll);
+            let seg = &text[startb..];
+            let endb = byte_after_cols(seg, avail);
+            let shown = &seg[..endb.min(seg.len())];
+            if left_ell {
+                spans.push(dim());
             }
+            // 光标在可用文本区中的列（锚定最右列）
+            let cr = c_w.saturating_sub(scroll);
+            let cbb = byte_after_cols(shown, cr).min(shown.len());
+            let (before, rest) = shown.split_at(cbb);
+            spans.push(Span::styled(before, Style::new().fg(col)));
+            match rest.chars().next() {
+                Some(ch) => {
+                    let (ch, after) = rest.split_at(ch.len_utf8());
+                    spans.push(Span::styled(ch.to_string(), cur_style));
+                    spans.push(Span::styled(after, Style::new().fg(col)));
+                }
+                None => {
+                    spans.push(Span::styled(" ", cur_style));
+                }
+            }
+            if right_ell {
+                spans.push(dim());
+            }
+        } else {
+            // 极窄终端：至少显示提示符与光标
+            spans.push(Span::styled(" ", cur_style));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
