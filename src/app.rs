@@ -967,9 +967,8 @@ impl App {
             };
             fc.view.cursor_line1()
         };
-        // 进入后关闭自动换行与水平滚动，保证“行=整行文本”语义清晰
+        // 水平滚动归零，保证字符级渲染从行首可见；自动换行保持用户当前设置不变
         if let Content::File(fc) = &mut self.panes[0].content {
-            fc.wrap = false;
             fc.hscroll = 0;
         }
         self.mode = Mode::Visual(VisualState {
@@ -2706,63 +2705,77 @@ impl App {
                 };
                 // 光标字符列（蓝格）；光标在行尾后时用尾部空格块
                 let cur_cell = if is_cursor { Some(v.cur_col) } else { None };
-                // 组装本行 spans
-                let mut spans = vec![Span::styled(
-                    if is_cursor { "▶" } else { " " },
-                    Style::new()
-                        .fg(self.theme.cursor_marker)
-                        .add_modifier(Modifier::BOLD),
-                )];
-                spans.push(Span::styled(
-                    format!("{line1:>ln_w$}│"),
-                    Style::new()
-                        .fg(self.theme.line_number)
-                        .add_modifier(Modifier::DIM),
-                ));
-                let mut pos = 0usize;
-                let cur_b = cur_cell
-                    .map(|c| text.char_indices().nth(c).map(|x| x.0).unwrap_or(text.len()));
-                let lo_b = text.char_indices().nth(lo).map(|x| x.0).unwrap_or(text.len());
-                let hi_b = text
-                    .char_indices()
-                    .nth(hi)
-                    .map(|x| x.0)
-                    .unwrap_or(text.len());
-                // 前段：光标字符前、未选区域
-                while pos < text.len() {
-                    let next_b = pos + text[pos..].chars().next().unwrap().len_utf8();
-                    let in_sel = !empty_sel && pos >= lo_b && pos < hi_b;
-                    let is_cur = cur_b == Some(pos);
-                    if is_cur {
+                let dim_ln = || -> Span<'static> {
+                    Span::styled(
+                        "│",
+                        Style::new()
+                            .fg(self.theme.line_number)
+                            .add_modifier(Modifier::DIM),
+                    )
+                };
+                let segs: Vec<String> = if fc.wrap {
+                    if UnicodeWidthStr::width(text) <= budget1 {
+                        vec![text.to_string()]
+                    } else {
+                        wrap_cols(text, budget1)
+                    }
+                } else {
+                    vec![text.to_string()]
+                };
+                let cur_st = Style::new()
+                    .bg(self.theme.cursor_line_bg)
+                    .fg(self.theme.cursor_line_text);
+                let sel_st = Style::new().bg(Color::DarkGray).fg(Color::White);
+                let plain_st = Style::new().fg(self.theme.text);
+                let mut gi = 0usize; // 全局字符下标（跨段累计）
+                for (k, seg) in segs.iter().enumerate() {
+                    let mut spans: Vec<Span> = Vec::new();
+                    if k == 0 {
                         spans.push(Span::styled(
-                            text[pos..next_b].to_string(),
+                            if is_cursor { "▶" } else { " " },
                             Style::new()
-                                .bg(self.theme.cursor_line_bg)
-                                .fg(self.theme.cursor_line_text),
+                                .fg(self.theme.cursor_marker)
+                                .add_modifier(Modifier::BOLD),
                         ));
-                    } else if in_sel {
                         spans.push(Span::styled(
-                            text[pos..next_b].to_string(),
-                            Style::new().bg(Color::DarkGray).fg(Color::White),
+                            format!("{line1:>ln_w$}"),
+                            Style::new()
+                                .fg(self.theme.line_number)
+                                .add_modifier(Modifier::DIM),
                         ));
                     } else {
                         spans.push(Span::styled(
-                            text[pos..next_b].to_string(),
-                            Style::new().fg(self.theme.text),
+                            "↪",
+                            Style::new()
+                                .fg(self.theme.line_number)
+                                .add_modifier(Modifier::DIM),
+                        ));
+                        spans.push(Span::styled(
+                            " ".repeat(ln_w),
+                            Style::new().fg(self.theme.line_number),
                         ));
                     }
-                    pos = next_b;
+                    spans.push(dim_ln());
+                    for ch in seg.chars() {
+                        let st = if Some(gi) == cur_cell {
+                            cur_st.clone()
+                        } else if !empty_sel && gi >= lo && gi < hi {
+                            sel_st.clone()
+                        } else {
+                            plain_st.clone()
+                        };
+                        spans.push(Span::styled(ch.to_string(), st));
+                        gi += 1;
+                    }
+                    // 光标位于行尾后：在本行最后一段尾部追加空格光标块
+                    if is_cursor
+                        && cur_cell.unwrap_or(0) >= nchars
+                        && k + 1 == segs.len()
+                    {
+                        spans.push(Span::styled(" ", cur_st.clone()));
+                    }
+                    lines.push(Line::from(spans));
                 }
-                // 光标位于行尾后：追加一个空格光标块
-                if is_cursor && cur_cell.unwrap_or(0) >= nchars {
-                    spans.push(Span::styled(
-                        " ",
-                        Style::new()
-                            .bg(self.theme.cursor_line_bg)
-                            .fg(self.theme.cursor_line_text),
-                    ));
-                }
-                lines.push(Line::from(spans));
                 continue;
             }
             // 普通模式：整行光标蓝底 + 关键字高亮
